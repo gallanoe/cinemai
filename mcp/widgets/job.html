@@ -1,0 +1,271 @@
+<!doctype html>
+<meta charset="utf-8" />
+<style>
+  :root {
+    color-scheme: light;
+    --bg: transparent;
+    --fg: #1a1a1a;
+    --muted: #6b6b6b;
+    --surface: #f4f4f2;
+    --border: #e2e2de;
+    --accent: #c96442;
+    --danger: #b3261e;
+  }
+  :root.dark {
+    color-scheme: dark;
+    --fg: #ededeb;
+    --muted: #9a9a95;
+    --surface: #262624;
+    --border: #3a3a37;
+    --accent: #d4805f;
+    --danger: #f2b8b5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 14px/1.5 system-ui, -apple-system, sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+  }
+  .wrap { padding: 12px; }
+
+  /* --- pending ------------------------------------------------------- */
+  .frame {
+    aspect-ratio: 1 / 1;
+    width: 100%;
+    border-radius: 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    display: grid;
+    place-items: center;
+    overflow: hidden;
+    position: relative;
+  }
+  .frame.shimmer::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(100deg, transparent 20%, rgba(127, 127, 127, 0.14) 50%, transparent 80%);
+    background-size: 220% 100%;
+    animation: sweep 1.6s ease-in-out infinite;
+  }
+  @keyframes sweep {
+    from { background-position: 180% 0; }
+    to { background-position: -80% 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .frame.shimmer::after { animation: none; }
+  }
+  .status { text-align: center; z-index: 1; padding: 0 20px; }
+  .status .label { font-weight: 500; }
+  .status .timer { color: var(--muted); font-variant-numeric: tabular-nums; margin-top: 2px; }
+
+  /* --- result -------------------------------------------------------- */
+  .grid { display: grid; gap: 8px; }
+  .grid.multi { grid-template-columns: repeat(2, 1fr); }
+  .shot { width: 100%; border-radius: 10px; border: 1px solid var(--border); display: block; }
+
+  .meta { margin-top: 10px; display: flex; gap: 8px; align-items: flex-start; }
+  .meta .text { flex: 1; min-width: 0; }
+  .prompt { overflow-wrap: anywhere; }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+  button {
+    font: inherit;
+    padding: 6px 12px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--fg);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: default; }
+
+  .error { color: var(--danger); }
+  [hidden] { display: none !important; }
+</style>
+
+<div class="wrap">
+  <div id="frame" class="frame shimmer">
+    <div class="status">
+      <div class="label" id="label">Generating…</div>
+      <div class="timer" id="timer">0.0s</div>
+    </div>
+  </div>
+
+  <div id="grid" class="grid" hidden></div>
+
+  <div class="meta">
+    <div class="text">
+      <div class="prompt" id="prompt"></div>
+      <div class="sub" id="sub"></div>
+    </div>
+    <button id="download" hidden>Download</button>
+  </div>
+</div>
+
+<script type="module">
+/*__EXT_APPS_BUNDLE__*/
+const { App } = globalThis.ExtApps;
+
+(async () => {
+  const app = new App({ name: "CinemAIJob", version: "0.1.0" }, {}, { autoResize: true });
+
+  const el = {
+    frame: document.getElementById("frame"),
+    label: document.getElementById("label"),
+    timer: document.getElementById("timer"),
+    grid: document.getElementById("grid"),
+    prompt: document.getElementById("prompt"),
+    sub: document.getElementById("sub"),
+    download: document.getElementById("download"),
+  };
+
+  let jobId = null;
+  let startedAt = Date.now();
+  let polling = false;
+  let tick = null;
+  let latest = null;
+
+  const applyTheme = (t) => document.documentElement.classList.toggle("dark", t === "dark");
+  app.onhostcontextchanged = (ctx) => applyTheme(ctx?.theme);
+
+  // OpenRouter gives no incremental progress, so show honest elapsed time
+  // rather than a percentage bar implying precision we don't have.
+  const startTimer = () => {
+    tick = setInterval(() => {
+      el.timer.textContent = ((Date.now() - startedAt) / 1000).toFixed(1) + "s";
+    }, 100);
+  };
+  const stopTimer = () => tick && clearInterval(tick);
+
+  function renderPending(state) {
+    el.label.textContent = "Generating…";
+    if (state?.prompt) el.prompt.textContent = state.prompt;
+    if (state?.model) el.sub.textContent = state.model;
+  }
+
+  function renderDone(state) {
+    stopTimer();
+    latest = state;
+
+    el.frame.hidden = true;
+    el.grid.hidden = false;
+    el.grid.classList.toggle("multi", (state.images ?? []).length > 1);
+    el.grid.replaceChildren();
+
+    for (const img of state.images ?? []) {
+      const node = document.createElement("img");
+      node.className = "shot";
+      node.src = img.dataUrl;
+      node.alt = state.prompt ?? "Generated image";
+      el.grid.append(node);
+    }
+
+    el.prompt.textContent = state.prompt ?? "";
+    const secs = (state.elapsedMs / 1000).toFixed(1);
+    const cost = state.cost !== undefined ? ` · $${state.cost.toFixed(4)}` : "";
+    const dims = state.images?.[0] ? ` · ${state.images[0].width}×${state.images[0].height}` : "";
+    el.sub.textContent = `${state.model} · ${secs}s${dims}${cost}`;
+    el.download.hidden = false;
+
+    // Silent — Claude learns the handle resolved without a chat bubble firing
+    // on the user's behalf.
+    app.updateModelContext?.({
+      content: [
+        {
+          type: "text",
+          text: `Image ready: ${state.handle} ("${state.prompt}"). Displayed to the user. Use view_image only if you need to see it.`,
+        },
+      ],
+    });
+  }
+
+  function renderFailed(state) {
+    stopTimer();
+    el.frame.classList.remove("shimmer");
+    el.label.textContent = "Generation failed";
+    el.label.className = "label error";
+    el.timer.textContent = state.error ?? "Unknown error";
+  }
+
+  async function poll() {
+    if (polling || !jobId) return;
+    polling = true;
+    try {
+      const res = await app.callServerTool({ name: "get_job", arguments: { jobId } });
+      const state = JSON.parse(res.content[0].text);
+
+      if (state.status === "running") {
+        renderPending(state);
+        setTimeout(poll, 1500);
+      } else if (state.status === "succeeded") {
+        renderDone(state);
+      } else {
+        renderFailed(state);
+      }
+    } catch (err) {
+      stopTimer();
+      el.frame.classList.remove("shimmer");
+      el.label.textContent = "Widget error";
+      el.label.className = "label error";
+      el.timer.textContent = String(err?.message ?? err);
+    } finally {
+      polling = false;
+    }
+  }
+
+  app.ontoolresult = ({ content }) => {
+    let state;
+    try {
+      state = JSON.parse(content[0].text);
+    } catch {
+      // Almost always the host's payload cap swapping in a file pointer.
+      el.label.textContent = "Bad payload from host";
+      el.timer.textContent = String(content?.[0]?.text ?? "").slice(0, 120);
+      return;
+    }
+    jobId = state.jobId;
+    startedAt = Date.now();
+    renderPending(state);
+    startTimer();
+    poll();
+  };
+
+  el.download.addEventListener("click", async () => {
+    if (!jobId) return;
+    el.download.disabled = true;
+    el.download.textContent = "Preparing…";
+    try {
+      // Full resolution is fetched only on demand — polls stay small.
+      const res = await app.callServerTool({
+        name: "get_job",
+        arguments: { jobId, full: true },
+      });
+      const state = JSON.parse(res.content[0].text);
+      for (const [i, img] of (state.images ?? []).entries()) {
+        const [, mime, b64] = /^data:([^;]+);base64,(.*)$/.exec(img.dataUrl) ?? [];
+        if (!b64) continue;
+        const ext = (mime.split("/")[1] ?? "png").replace("jpeg", "jpg");
+        const suffix = (state.images.length > 1 ? `-${i + 1}` : "");
+        await app.downloadFile({
+          name: `cinemai-${state.jobId.slice(0, 8)}${suffix}.${ext}`,
+          mimeType: mime,
+          content: b64,
+        });
+      }
+      el.download.textContent = "Download";
+    } catch (err) {
+      el.download.textContent = "Failed";
+      console.error(err);
+    } finally {
+      el.download.disabled = false;
+    }
+  });
+
+  await app.connect();
+  applyTheme(app.getHostContext?.()?.theme);
+})();
+</script>

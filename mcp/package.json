@@ -1,0 +1,25 @@
+{
+  "name": "cinemai-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP app server exposing OpenRouter image generation with an inline progress widget",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch --preserveWatchOutput & node --watch --env-file=.env dist/server.js",
+    "start": "node --env-file=.env dist/server.js",
+    "smoke": "node --env-file=.env dist/scripts/smoke-openrouter.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^1.7.4",
+    "@modelcontextprotocol/sdk": "^1.20.0",
+    "express": "^5.1.0",
+    "sharp": "^0.34.4",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
