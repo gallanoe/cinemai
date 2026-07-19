@@ -154,8 +154,19 @@ widget frame, check the installed version first.
 `_meta["ui/resourceUri"]` for host compatibility — worth using the helper rather than writing
 `_meta` by hand.
 
-## Not yet verified
+## Verification status
 
-- **Cowork in both execution modes.** Whether the `data:` URL renders with "run on your computer"
-  on *and* off. This is the least-tested assumption in the design.
-- **Real generation end to end** — requires a live `OPENROUTER_API_KEY`.
+Verified against a live key:
+
+- End-to-end generation — `generate_image` returns in ~40ms with a ~230-byte handle payload and
+  no base64; job completes in ~7s; `get_job` and `view_image` both return correctly sized images.
+- Capability validation rejects `n > max` and unsupported aspect ratios without spending.
+- Restart recovery — a job left `running` is marked `failed` on boot.
+
+**Not yet verified: the widget rendering in a host.** The first attempt produced a blank iframe
+caused by the ext-apps `0.x` pin described above. That is fixed but has not been re-tested in
+Claude Desktop or Cowork since the upgrade. Specifically untested:
+
+- Whether the widget renders at all post-upgrade.
+- Cowork with "run on your computer" **on vs. off** — the `data:` URL approach was chosen to make
+  this a non-issue, but that has never been confirmed empirically.
