@@ -77,9 +77,28 @@ export async function validateRequest(params: {
   model: string;
   n?: number;
   aspect_ratio?: string;
+  inputReferences?: number;
 }): Promise<Validation> {
   const caps = (await loadModelCaps()).get(params.model);
   if (!caps) return { ok: true };
+
+  // Reference support varies widely — some models take 16, others 4, others
+  // none. As elsewhere here, an unreported capability means "skip the check"
+  // rather than "unsupported": a false rejection would block a working call.
+  if (
+    params.inputReferences !== undefined &&
+    params.inputReferences > 0 &&
+    caps.maxInputReferences !== undefined &&
+    params.inputReferences > caps.maxInputReferences
+  ) {
+    return {
+      ok: false,
+      message:
+        caps.maxInputReferences === 0
+          ? `${params.model} does not accept reference images. Omit input_references, or pick a model that supports image input.`
+          : `${params.model} accepts at most ${caps.maxInputReferences} reference image(s); got ${params.inputReferences}.`,
+    };
+  }
 
   if (params.n !== undefined && caps.maxN !== undefined && params.n > caps.maxN) {
     return {

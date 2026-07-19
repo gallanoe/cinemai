@@ -2,6 +2,9 @@ import { config } from "./config.js";
 
 const ENDPOINT = "https://openrouter.ai/api/v1/images";
 
+/** A reference image: an HTTP(S) URL or a base64 data URL. */
+export type InputReference = { type: "image_url"; image_url: { url: string } };
+
 export type GenerateParams = {
   prompt: string;
   model?: string;
@@ -9,6 +12,7 @@ export type GenerateParams = {
   size?: string;
   aspect_ratio?: string;
   seed?: number;
+  input_references?: InputReference[];
 };
 
 export type GeneratedImage = { bytes: Buffer; mediaType: string };
@@ -42,6 +46,7 @@ export async function generateImages(
   if (params.size !== undefined) body.size = params.size;
   if (params.aspect_ratio !== undefined) body.aspect_ratio = params.aspect_ratio;
   if (params.seed !== undefined) body.seed = params.seed;
+  if (params.input_references?.length) body.input_references = params.input_references;
 
   const res = await fetch(ENDPOINT, {
     method: "POST",

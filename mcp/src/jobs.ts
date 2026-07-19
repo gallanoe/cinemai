@@ -16,6 +16,9 @@ export type Job = {
   aspectRatio?: string;
   seed?: number;
   n: number;
+  /** The reference *specs* as given, never the resolved bytes — a job record
+   *  with base64 inlined would be megabytes of JSON per generation. */
+  inputReferences?: string[];
   createdAt: number;
   completedAt?: number;
   /** Filenames under data/images, relative. */
@@ -83,7 +86,10 @@ export function getJob(id: string): Job | undefined {
  * so the tool handler can respond in milliseconds — a blocking tools/call would
  * freeze the conversation turn for the full 10-90s generation.
  */
-export async function startJob(params: GenerateParams & { n: number }): Promise<Job> {
+export async function startJob(
+  params: GenerateParams & { n: number },
+  refSpecs?: string[],
+): Promise<Job> {
   const job: Job = {
     id: randomUUID(),
     status: "running",
@@ -93,6 +99,7 @@ export async function startJob(params: GenerateParams & { n: number }): Promise<
     aspectRatio: params.aspect_ratio,
     seed: params.seed,
     n: params.n,
+    ...(refSpecs?.length ? { inputReferences: refSpecs } : {}),
     createdAt: Date.now(),
   };
   jobs.set(job.id, job);

@@ -12,6 +12,7 @@ import {
   type Job,
 } from "./jobs.js";
 import { validateRequest } from "./models.js";
+import { resolveReferences } from "./references.js";
 
 export const WIDGET_URI = "ui://widgets/job.html";
 
@@ -27,6 +28,7 @@ const jobSummary = (job: Job) => ({
   model: job.model,
   aspectRatio: job.aspectRatio,
   ...(job.n > 1 ? { n: job.n } : {}),
+  ...(job.inputReferences?.length ? { inputReferences: job.inputReferences } : {}),
   ...(job.error ? { error: job.error } : {}),
 });
 
@@ -61,6 +63,18 @@ export function registerTools(server: McpServer): void {
               `Defaults to ${DEFAULT_ASPECT_RATIO}.`,
           ),
         seed: z.number().int().optional().describe("Seed for deterministic generation."),
+        input_references: z
+          .array(z.string())
+          .max(16)
+          .optional()
+          .describe(
+            "Reference images to guide or edit from. Each entry is one of: an image handle " +
+              'from a previous generation ("image://gen/<id>", or "image://gen/<id>#2" for the ' +
+              'third image of a multi-image job); a public "https://" URL; or an ABSOLUTE file ' +
+              'path on the user\'s machine ("/Users/me/photo.png"). Use this to iterate on an ' +
+              "earlier result or to work from an image the user supplied. Relative paths are " +
+              "not accepted. Support and max count vary by model.",
+          ),
       },
       _meta: { ui: { resourceUri: WIDGET_URI } },
     },
@@ -72,20 +86,42 @@ export function registerTools(server: McpServer): void {
       const aspectRatio = args.aspect_ratio ?? DEFAULT_ASPECT_RATIO;
       const n = args.n ?? 1;
 
+      const specs = args.input_references ?? [];
+
       // Catch provider-rejected combinations before spending a generation.
-      const check = await validateRequest({ model, n, aspect_ratio: aspectRatio });
+      const check = await validateRequest({
+        model,
+        n,
+        aspect_ratio: aspectRatio,
+        inputReferences: specs.length,
+      });
       if (!check.ok) {
         return { content: [{ type: "text", text: check.message }], isError: true };
       }
 
-      const job = await startJob({
-        prompt: args.prompt,
-        model: args.model,
-        n,
-        size: args.size,
-        aspect_ratio: aspectRatio,
-        seed: args.seed,
-      });
+      // Resolve references here rather than inside the job: a missing file or a
+      // bad handle is a caller mistake the model can fix immediately, and it
+      // would be invisible if it surfaced as a job failure 30s later.
+      let resolved;
+      try {
+        resolved = await resolveReferences(specs);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text", text: message }], isError: true };
+      }
+
+      const job = await startJob(
+        {
+          prompt: args.prompt,
+          model: args.model,
+          n,
+          size: args.size,
+          aspect_ratio: aspectRatio,
+          seed: args.seed,
+          ...(resolved.length ? { input_references: resolved.map((r) => r.ref) } : {}),
+        },
+        resolved.map((r) => r.source),
+      );
 
       // Handle + metadata only. No bytes — this is the core invariant.
       return { content: [{ type: "text", text: JSON.stringify(jobSummary(job)) }] };

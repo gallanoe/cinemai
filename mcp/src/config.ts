@@ -27,3 +27,12 @@ export const config = {
 /** Sizes, in px on the long edge, for the two downscaled variants we serve. */
 export const DISPLAY_MAX_PX = 1024; // widget rendering
 export const INSPECT_MAX_PX = 768; // view_image — keeps model context cheap
+
+/**
+ * Ceiling for outbound reference images. These go into the OpenRouter request
+ * body rather than a tool result, so the ~150k host cap is irrelevant; the
+ * limit exists to keep request bodies sane. Larger than the display variants
+ * because a reference feeds a generation instead of just being displayed.
+ */
+export const REFERENCE_MAX_PX = 2048;
+export const REFERENCE_MAX_BYTES = 4 * 1024 * 1024;

@@ -33,6 +33,21 @@ environment is a user-flippable setting, not a fixed property. A `http://localho
 reference would work in local mode and break the moment someone toggles. The `data:` path rides
 the MCP connection itself and is correct either way.
 
+## Deployment model: local-first
+
+This server is designed to **run on the user's own machine**. It can be hosted remotely — nothing
+in the transport assumes otherwise — but two things are meaningfully better locally:
+
+- **Reference images by file path.** `input_references` accepts an absolute path so the user can
+  say "use this photo" about a file they already have. A remote server has no access to that
+  filesystem, and the path resolves to a clear error rather than silently doing something else.
+- **Generated images stay on the user's disk** under `data/`, rather than accumulating on a shared
+  host.
+
+This does **not** retract the `data:` URL decision below. Cowork's per-task execution toggle means
+even a "local" deployment can move, so pixels still reach the widget over the MCP connection rather
+than via `http://localhost`. Local-first is the target; it is not an assumption the transport makes.
+
 ## Setup
 
 ```bash
@@ -85,7 +100,7 @@ so polling, rendering, and the download button all exercise real handlers.
 
 | Tool | Visibility | Returns |
 |---|---|---|
-| `generate_image` | model | `{handle, jobId, status, prompt, model}` — no bytes, ~45ms |
+| `generate_image` | model | `{handle, jobId, status, prompt, model}` — no bytes, ~45ms; optional `input_references` |
 | `get_job` | widget only (`_meta.ui.visibility: ["app"]`) | status + display-sized `data:` URLs |
 | `view_image` | model | image content block, downscaled to 768px |
 
@@ -95,6 +110,42 @@ user-driven, so the tool is what makes an image reachable by the *model*.
 
 `view_image`'s description states its token cost. That sentence is the main lever on whether the
 model reads every image reflexively or only when seeing it actually matters.
+
+## Reference images (image-to-image)
+
+`generate_image` takes an optional `input_references: string[]`, forwarded to OpenRouter's
+`input_references` parameter. Each entry is a plain string, disambiguated by shape:
+
+| Form | Example | Resolution |
+|---|---|---|
+| Generated image | `image://gen/<id>`, `image://gen/<id>#2` | read from `data/images/`, encoded server-side |
+| Public URL | `https://example.com/photo.jpg` | passed through; OpenRouter fetches it |
+| Local file | `/Users/me/photo.png` | read from the server's filesystem, encoded server-side |
+
+A flat `string[]` rather than an array of `{type, image_url}` objects: models fill in the flat form
+far more reliably, and the object wrapper carries no information we can't infer. **Relative paths
+are rejected** — `photo.png` is ambiguous against a bare job id, and resolving it against the
+server's cwd is never what the caller meant.
+
+The `#<index>` suffix addresses one image of a multi-image job. Bare ids work too.
+
+**References are resolved in the tool handler, before the job is created.** A missing file or a
+stale handle is a caller mistake that should come back as an immediate tool error the model can
+correct — not as a job that fails 30 seconds later in a widget.
+
+**Job records store the reference *specs*, never the resolved bytes.** `data/jobs/<id>.json` would
+otherwise be megabytes of inlined base64 per generation.
+
+Outbound references cap at `REFERENCE_MAX_PX` (2048) and 4 MB. Images already under both limits are
+sent **as-is**, preserving PNG alpha, which can carry real meaning in edit-style prompts. Larger
+ones are downscaled to JPEG q90 — higher than the q82 used for display variants, because a
+reference is an *input* to another generation, so artifacts compound instead of merely being seen.
+The ~150k host cap does not apply on this path: these bytes go into the OpenRouter request body,
+not a tool result.
+
+> **A model-supplied absolute path is read from disk.** That is the intended capability for a
+> local single-user server, and it is worth being deliberate about before hosting this for anyone
+> else. There is no path allowlist.
 
 ## Sizing and validation
 
@@ -109,8 +160,14 @@ validated locally before spending a generation:
 
 - `n` against the model's max — the default model caps at **1**, despite the schema allowing more
 - `aspect_ratio` against the model's supported enum
+- `input_references` count against the model's max — this varies a lot: `openai/gpt-image-*` accept
+  16, `bytedance-seed/seedream-4.5` 14, and the default `google/gemini-2.5-flash-image` only **3**
 
-Both failures return the supported values rather than a provider error.
+These failures return the supported values rather than a provider error.
+
+An **unreported** capability skips its check rather than rejecting. Some models omit descriptors —
+`google/gemini-2.5-flash-image-preview` reports no `input_references` range at all — and a false
+rejection would block a call that would have worked. Unknown model → allow, same principle.
 
 ## Codec choice
 
@@ -158,10 +215,17 @@ widget frame, check the installed version first.
 
 Verified against a live key:
 
+- Capability descriptors for `input_references` — 40 image models returned; the `{type: "range",
+  min, max}` shape matches what `models.ts` parses. Per-model maxima as listed above.
 - End-to-end generation — `generate_image` returns in ~40ms with a ~230-byte handle payload and
   no base64; job completes in ~7s; `get_job` and `view_image` both return correctly sized images.
 - Capability validation rejects `n > max` and unsupported aspect ratios without spending.
 - Restart recovery — a job left `running` is marked `failed` on boot.
+
+**Not yet verified: a generation that actually sends `input_references`.** The capability
+descriptors are confirmed live and the code typechecks, but no round trip has been made with a
+reference attached — so the request-body shape OpenRouter accepts is still taken from the docs
+rather than observed. All three source forms are unexercised.
 
 **Not yet verified: the widget rendering in a host.** The first attempt produced a blank iframe
 caused by the ext-apps `0.x` pin described above. That is fixed but has not been re-tested in
