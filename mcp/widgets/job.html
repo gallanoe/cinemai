@@ -141,8 +141,17 @@ const { App } = globalThis.ExtApps;
   };
   const stopTimer = () => tick && clearInterval(tick);
 
+  // The server always sends an explicit aspect ratio, so the placeholder can
+  // match the final image's shape and nothing reflows when it arrives.
+  function applyAspect(ratio) {
+    if (!ratio) return;
+    const [w, h] = String(ratio).split(":").map(Number);
+    if (w > 0 && h > 0) el.frame.style.aspectRatio = `${w} / ${h}`;
+  }
+
   function renderPending(state) {
     el.label.textContent = "Generating…";
+    applyAspect(state?.aspectRatio);
     if (state?.prompt) el.prompt.textContent = state.prompt;
     if (state?.model) el.sub.textContent = state.model;
   }
@@ -229,6 +238,8 @@ const { App } = globalThis.ExtApps;
     }
     jobId = state.jobId;
     startedAt = Date.now();
+    // Size the frame from the very first paint, before any polling.
+    applyAspect(state.aspectRatio);
     renderPending(state);
     startTimer();
     poll();

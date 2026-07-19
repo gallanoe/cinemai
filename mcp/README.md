@@ -96,6 +96,22 @@ user-driven, so the tool is what makes an image reachable by the *model*.
 `view_image`'s description states its token cost. That sentence is the main lever on whether the
 model reads every image reflexively or only when seeing it actually matters.
 
+## Sizing and validation
+
+`generate_image` **always sends an explicit `aspect_ratio`** (defaulting to `1:1`), rather than
+letting the provider pick. That makes the output shape known at job-creation time, so the widget
+sizes its placeholder correctly from the first paint instead of rendering square and snapping when
+the image lands. Providers round to pixel multiples, so the final image can be ~2% off the exact
+ratio — imperceptible.
+
+Capabilities are fetched once from `/api/v1/images/models` and cached at boot. Requests are
+validated locally before spending a generation:
+
+- `n` against the model's max — the default model caps at **1**, despite the schema allowing more
+- `aspect_ratio` against the model's supported enum
+
+Both failures return the supported values rather than a provider error.
+
 ## Codec choice
 
 Originals are stored exactly as OpenRouter returned them (usually PNG) and served that way for

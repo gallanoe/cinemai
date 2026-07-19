@@ -11,8 +11,13 @@ import {
   toDataUrl,
   type Job,
 } from "./jobs.js";
+import { validateRequest } from "./models.js";
 
 export const WIDGET_URI = "ui://widgets/job.html";
+
+/** Fallback when the caller doesn't specify one. Always sent explicitly, so the
+ *  widget can size its placeholder before any pixels exist. */
+export const DEFAULT_ASPECT_RATIO = "1:1";
 
 const jobSummary = (job: Job) => ({
   handle: handleFor(job.id),
@@ -20,6 +25,7 @@ const jobSummary = (job: Job) => ({
   status: job.status,
   prompt: job.prompt,
   model: job.model,
+  aspectRatio: job.aspectRatio,
   ...(job.n > 1 ? { n: job.n } : {}),
   ...(job.error ? { error: job.error } : {}),
 });
@@ -46,18 +52,38 @@ export function registerTools(server: McpServer): void {
           .describe(`OpenRouter image model slug. Defaults to ${config.defaultModel}.`),
         n: z.number().int().min(1).max(4).optional().describe("How many images (1-4). Default 1."),
         size: z.string().optional().describe('Size tier ("2K") or pixels ("2048x2048").'),
-        aspect_ratio: z.string().optional().describe('Aspect ratio, e.g. "1:1", "16:9", "9:16".'),
+        aspect_ratio: z
+          .string()
+          .optional()
+          .describe(
+            'Aspect ratio, e.g. "1:1", "16:9", "9:16", "4:3", "21:9". Choose one that suits the ' +
+              `subject — widescreen for cinematic or landscape shots, tall for portraits. ` +
+              `Defaults to ${DEFAULT_ASPECT_RATIO}.`,
+          ),
         seed: z.number().int().optional().describe("Seed for deterministic generation."),
       },
       _meta: { ui: { resourceUri: WIDGET_URI } },
     },
     async (args) => {
+      const model = args.model ?? config.defaultModel;
+      // Always send an explicit aspect ratio. Providers differ in what they
+      // default to, and the widget needs the shape up front to size its
+      // placeholder — otherwise the frame renders square and snaps on arrival.
+      const aspectRatio = args.aspect_ratio ?? DEFAULT_ASPECT_RATIO;
+      const n = args.n ?? 1;
+
+      // Catch provider-rejected combinations before spending a generation.
+      const check = await validateRequest({ model, n, aspect_ratio: aspectRatio });
+      if (!check.ok) {
+        return { content: [{ type: "text", text: check.message }], isError: true };
+      }
+
       const job = await startJob({
         prompt: args.prompt,
         model: args.model,
-        n: args.n ?? 1,
+        n,
         size: args.size,
-        aspect_ratio: args.aspect_ratio,
+        aspect_ratio: aspectRatio,
         seed: args.seed,
       });
 
@@ -101,6 +127,7 @@ export function registerTools(server: McpServer): void {
         status: job.status,
         prompt: job.prompt,
         model: job.model,
+        aspectRatio: job.aspectRatio,
         elapsedMs: (job.completedAt ?? Date.now()) - job.createdAt,
       };
       if (job.error) payload.error = job.error;

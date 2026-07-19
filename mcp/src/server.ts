@@ -10,6 +10,7 @@ import {
 } from "@modelcontextprotocol/ext-apps/server";
 import { config } from "./config.js";
 import { initJobStore } from "./jobs.js";
+import { loadModelCaps } from "./models.js";
 import { WIDGET_URI, registerTools } from "./tools.js";
 
 const require = createRequire(import.meta.url);
@@ -73,6 +74,8 @@ function buildServer(widgetHtml: string): McpServer {
 
 const widgetHtml = loadWidget("job.html");
 await initJobStore();
+// Warm the capability cache so the first generate_image doesn't pay for it.
+void loadModelCaps();
 
 const app = express();
 app.use(express.json({ limit: "16mb" }));
@@ -140,6 +143,7 @@ app.post("/dev/tool/:name", async (req, res) => {
     status: job.status,
     prompt: job.prompt,
     model: job.model,
+    aspectRatio: job.aspectRatio,
     elapsedMs: (job.completedAt ?? Date.now()) - job.createdAt,
     ...(job.error ? { error: job.error } : {}),
     ...(job.cost !== undefined ? { cost: job.cost } : {}),
