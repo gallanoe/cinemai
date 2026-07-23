@@ -81,6 +81,13 @@ export function getJob(id: string): Job | undefined {
   return jobs.get(id);
 }
 
+/** Absolute path to the original, full-resolution bytes of image `index`. */
+export function imageFilePath(job: Job, index: number): string {
+  const file = job.files?.[index];
+  if (!file) throw new Error(`Job ${job.id} has no image at index ${index}.`);
+  return resolve(imagesDir(), file);
+}
+
 /**
  * Create a job and kick off generation WITHOUT awaiting it. Returns immediately
  * so the tool handler can respond in milliseconds — a blocking tools/call would
@@ -160,8 +167,9 @@ export async function readVariant(
   const original = await readFile(resolve(imagesDir(), file));
 
   if (maxPx === null) {
-    // Full resolution keeps the original bytes and codec — this path is only
-    // used for download, where fidelity matters and there is no payload cap.
+    // Full resolution keeps the original bytes and codec. Used by the resource
+    // handler and the chunked download path — never inlined whole into a tool
+    // result, which the host would truncate around 150k chars.
     const meta = await sharp(original).metadata();
     return {
       buffer: original,
@@ -192,3 +200,32 @@ export async function readVariant(
 
 export const toDataUrl = (v: Variant) =>
   `data:${v.mediaType};base64,${v.buffer.toString("base64")}`;
+
+/** Full-resolution base64 of the ORIGINAL on-disk bytes, cached per image. */
+const fullBase64Cache = new Map<string, FullImage>();
+
+export type FullImage = { base64: string; mediaType: string; ext: string };
+
+/**
+ * The full-resolution image as one base64 string, for the widget's chunked
+ * download. The Download button reassembles it from slices of THIS string —
+ * slicing the base64 text (not the raw buffer) means chunk boundaries never
+ * land mid-triplet, so plain concatenation restores the original exactly.
+ */
+export async function readFullImageBase64(job: Job, index: number): Promise<FullImage> {
+  const file = job.files?.[index];
+  if (!file) throw new Error(`Job ${job.id} has no image at index ${index}.`);
+
+  const key = `${job.id}:${index}`;
+  const cached = fullBase64Cache.get(key);
+  if (cached) return cached;
+
+  const bytes = await readFile(resolve(imagesDir(), file));
+  const entry: FullImage = {
+    base64: bytes.toString("base64"),
+    mediaType: job.mediaType ?? "image/png",
+    ext: file.split(".").pop() ?? "png",
+  };
+  fullBase64Cache.set(key, entry);
+  return entry;
+}

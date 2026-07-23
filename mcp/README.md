@@ -10,10 +10,13 @@ generate_image  ──> {handle, status: "running"}          the model sees this
                 └─> widget polls get_job
                         └─> data: URL                     the model never sees this
 view_image      ──> image content block, 768px            the model sees this ON REQUEST
+Download button ──> get_image_chunk ─> full-res file      the USER saves this (host download)
+save_image      ──> full-res file in the export folder    the AGENT saves this to the workspace
 ```
 
-Three delivery paths, three audiences: **handle** for the model, **`data:` URL** for the eye,
-**`view_image`** for opt-in inspection.
+Delivery paths by audience: **handle** for the model, **`data:` URL** for the eye, **`view_image`**
+for opt-in inspection, and two full-resolution exits — the widget's **Download button** (user) and
+**`save_image`** (agent). None of the full-res paths put bytes in the conversation.
 
 ### Why it's built this way
 
@@ -32,6 +35,14 @@ has a per-task execution toggle ("This task will run on your computer"), so the 
 environment is a user-flippable setting, not a fixed property. A `http://localhost:3000/img/<id>`
 reference would work in local mode and break the moment someone toggles. The `data:` path rides
 the MCP connection itself and is correct either way.
+
+**Full-resolution bytes never fit a single tool result, so they're never sent as one.** The same
+~150k cap that keeps generation bytes out of chat also bounds the widget's Download button: a full
+2K PNG is ~1.4–2M base64 chars, ~10× over. The button therefore streams the image through
+`get_image_chunk` in <100k-char **base64-string** slices and reassembles them in the widget — the
+slices are of the base64 text, not the raw buffer, so boundaries never land mid-triplet and plain
+concatenation restores the bytes exactly. `save_image` sidesteps the cap entirely by copying on
+disk and returning only a path. Both ride transports that are correct under either execution mode.
 
 ## Deployment model: local-first
 
@@ -93,8 +104,9 @@ skipping the Desktop quit-relaunch cycle entirely:
 http://localhost:3000/widget-preview?payload={"jobId":"<id>"}&theme=dark
 ```
 
-The preview injects a fake `ExtApps` shim whose `callServerTool` proxies to `/dev/tool/get_job`,
-so polling, rendering, and the download button all exercise real handlers.
+The preview injects a fake `ExtApps` shim whose `callServerTool` proxies to `/dev/tool/<name>`
+(`get_job` and `get_image_chunk`), so polling, rendering, and the chunked Download button all
+exercise real handlers. The shim's `downloadFile` just logs the resource block rather than saving.
 
 ## Tools
 
@@ -102,7 +114,9 @@ so polling, rendering, and the download button all exercise real handlers.
 |---|---|---|
 | `generate_image` | model | `{handle, jobId, status, prompt, model}` — no bytes, ~45ms; optional `input_references` |
 | `get_job` | widget only (`_meta.ui.visibility: ["app"]`) | status + display-sized `data:` URLs |
+| `get_image_chunk` | widget only (`_meta.ui.visibility: ["app"]`) | one full-res image as a base64-string slice, for the Download button |
 | `view_image` | model | image content block, downscaled to 768px |
+| `save_image` | model | writes the full-res file to the export folder; returns the saved name + host path, no bytes |
 
 `image://gen/<id>` is also registered as a resource template so a user can deliberately attach a
 generated image. It complements `view_image` rather than replacing it: in most hosts resources are
@@ -110,6 +124,44 @@ user-driven, so the tool is what makes an image reachable by the *model*.
 
 `view_image`'s description states its token cost. That sentence is the main lever on whether the
 model reads every image reflexively or only when seeing it actually matters.
+
+## Full-resolution exits: Download button and `save_image`
+
+Two ways to get the real file out, for two actors.
+
+**The widget Download button** is user-driven. It streams the full-res image through
+`get_image_chunk` (see the rationale above) and hands the reassembled base64 to the host's
+`downloadFile` — the host owns the save location, exactly like a browser download. This makes the
+whole "which filesystem does the container see" question moot: nothing is written server-side and
+no path is guessed. `downloadFile` takes MCP resource content blocks
+(`{contents: [{type: "resource", resource: {uri: "file:///name.png", mimeType, blob}}]}`), and the
+saved filename is the `file:///` URI's basename — **not** a flat `{name, content}` object.
+
+**`save_image`** is agent-driven, for "keep this / put it in my project" without a human clicking.
+Here the container question is real and unavoidable, so the design answers it structurally: **the
+server owns the directory; the agent only names the file.**
+
+- Files land in `CINEMAI_EXPORT_DIR` (default `~/Documents/Claude` — Cowork's hardcoded working
+  directory on macOS, the highest-probability folder mounted into a sandboxed agent's workspace).
+- `filename` may include subfolders but is **contained**: absolute paths and `../` escapes are
+  rejected by resolving against the export dir and checking the result stays inside. The extension
+  is forced to the true on-disk format, since bytes are copied rather than transcoded.
+- The result reports the workspace-relative name (what a sandboxed agent opens) **and** the host
+  absolute path (for the user). There is no reliable way to compute the agent's VM-side mount path
+  ([claude-code#27758](https://github.com/anthropics/claude-code/issues/27758) — closed as
+  not-planned), so the basename is how the agent finds the file in its own tree.
+
+**Why not let the agent pass a destination path?** Under Cowork the server runs on the host and the
+agent in a VM; the two have different path namespaces and the host does **not** rewrite paths inside
+MCP tool arguments. A destination the agent invents would be meaningless to the server. Inverting
+control — server picks the folder, agent picks the name — is the only arrangement that works across
+both execution modes.
+
+> **This only round-trips to the agent if `CINEMAI_EXPORT_DIR` is a folder attached to the session.**
+> The VirtioFS mount is what makes a host-written file appear on the agent's side. If the export dir
+> isn't an attached workspace folder, the file still lands correctly on the host — good for local
+> desktop use — but the agent won't see it. The tool can't detect the difference; point the setting
+> at an attached folder.
 
 ## Reference images (image-to-image)
 
@@ -171,9 +223,10 @@ rejection would block a call that would have worked. Unknown model → allow, sa
 
 ## Codec choice
 
-Originals are stored exactly as OpenRouter returned them (usually PNG) and served that way for
-download. Everything that travels **inside a tool result** — the widget's display variant and
-`view_image` — is re-encoded to **JPEG q82**.
+Originals are stored exactly as OpenRouter returned them (usually PNG) and delivered untouched by
+both full-resolution exits — the Download button (streamed via `get_image_chunk`) and `save_image`
+(copied on disk). Everything that travels **inside a tool result** — the widget's display variant
+and `view_image` — is re-encoded to **JPEG q82**.
 
 This is not an aesthetic call. A 768px PNG of a photographic image is ~580KB, which is ~800k
 base64 chars against a ~150k host cap — it would be silently truncated. Measured on a real
@@ -221,16 +274,24 @@ Verified against a live key:
   no base64; job completes in ~7s; `get_job` and `view_image` both return correctly sized images.
 - Capability validation rejects `n > max` and unsupported aspect ratios without spending.
 - Restart recovery — a job left `running` is marked `failed` on boot.
+- Widget rendering and the chunked **Download button** in Claude Desktop — confirmed working after
+  fixing two stacked bugs: full-res bytes overflowed the tool-result cap (now streamed via
+  `get_image_chunk`), and `downloadFile` had been called with the wrong argument shape
+  (`{name, content}` instead of `{contents: [{resource: {…blob}}]}`).
+- `save_image` filename handling — containment (`../` and absolute paths rejected), extension
+  correction, and a full-resolution copy verified locally against a real job.
 
 **Not yet verified: a generation that actually sends `input_references`.** The capability
 descriptors are confirmed live and the code typechecks, but no round trip has been made with a
 reference attached — so the request-body shape OpenRouter accepts is still taken from the docs
 rather than observed. All three source forms are unexercised.
 
-**Not yet verified: the widget rendering in a host.** The first attempt produced a blank iframe
-caused by the ext-apps `0.x` pin described above. That is fixed but has not been re-tested in
-Claude Desktop or Cowork since the upgrade. Specifically untested:
+**Not yet verified: `save_image` round-tripping into a sandboxed agent.** The write path is
+confirmed locally, but that a file written to `CINEMAI_EXPORT_DIR` on the host actually surfaces in
+a Cowork agent's mounted workspace — the whole point of the export-folder design — has not been
+observed. It depends on the export dir being an attached workspace folder (see that section), which
+the tool can't enforce.
 
-- Whether the widget renders at all post-upgrade.
-- Cowork with "run on your computer" **on vs. off** — the `data:` URL approach was chosen to make
-  this a non-issue, but that has never been confirmed empirically.
+**Not yet verified: Cowork specifically.** The widget renders and the Download button works in
+Claude Desktop, but Cowork with "run on your computer" **on vs. off** — the case the `data:` URL and
+chunked-transport choices were made for — has never been confirmed empirically.

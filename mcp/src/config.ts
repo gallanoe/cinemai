@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
+import { homedir } from "node:os";
 
 /** Package root — dist/config.js lives one level down, so go up one. */
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -22,6 +23,13 @@ export const config = {
   defaultModel: process.env.CINEMAI_DEFAULT_MODEL ?? "google/gemini-2.5-flash-image",
   dataDir: resolve(ROOT, process.env.CINEMAI_DATA_DIR ?? "./data"),
   widgetsDir: resolve(ROOT, "widgets"),
+  // Where save_image lands files. The default is Cowork's hardcoded working
+  // directory on macOS — the highest-probability folder that's mounted into a
+  // sandboxed agent's workspace. When the server runs on the host and the agent
+  // in a VM, a file written here surfaces in the agent's mounted tree; there is
+  // no reliable way to compute the agent-side path, so the tool reports this
+  // host path and the basename and lets the agent find it by name.
+  exportDir: resolve(process.env.CINEMAI_EXPORT_DIR ?? resolve(homedir(), "Documents", "Claude")),
 };
 
 /** Sizes, in px on the long edge, for the two downscaled variants we serve. */

@@ -119,7 +119,7 @@ app.get("/widget-preview", (req, res) => {
     }
     sendMessage(m){ console.log("sendMessage", m); }
     updateModelContext(m){ console.log("updateModelContext", m); }
-    downloadFile(f){ console.log("downloadFile", f.name, f.mimeType, f.content.length + " b64 chars"); }
+    downloadFile(f){ const c=(f.contents&&f.contents[0]&&f.contents[0].resource)||{}; console.log("downloadFile", c.uri, c.mimeType, ((c.blob||"").length) + " b64 chars"); return { isError:false }; }
     openLink({url}){ window.open(url, "_blank"); }
   }};`;
   const html = readFileSync(resolve(config.widgetsDir, "job.html"), "utf8").replace(
@@ -131,10 +131,29 @@ app.get("/widget-preview", (req, res) => {
 
 /** Dev-only: lets the preview shim reach real tool handlers over plain HTTP. */
 app.post("/dev/tool/:name", async (req, res) => {
-  const { getJob, handleFor, readVariant, toDataUrl } = await import("./jobs.js");
-  if (req.params.name !== "get_job") return res.status(404).json({ error: "unknown tool" });
-
+  const { getJob, handleFor, readVariant, toDataUrl, readFullImageBase64 } = await import("./jobs.js");
   const job = getJob(req.body.jobId);
+
+  // Mirror get_image_chunk so the Download button works in preview too.
+  if (req.params.name === "get_image_chunk") {
+    if (!job || job.status !== "succeeded" || !job.files) return res.json({ error: "not ready" });
+    const i = req.body.index ?? 0;
+    const { base64, mediaType, ext } = await readFullImageBase64(job, i);
+    const start = req.body.offset ?? 0;
+    const chunk = base64.slice(start, start + (req.body.length ?? 100_000));
+    return res.json({
+      index: i,
+      imageCount: job.files.length,
+      mediaType,
+      ext,
+      totalChars: base64.length,
+      offset: start,
+      chunk,
+      done: start + chunk.length >= base64.length,
+    });
+  }
+
+  if (req.params.name !== "get_job") return res.status(404).json({ error: "unknown tool" });
   if (!job) return res.json({ status: "failed", error: "Unknown job id." });
 
   const payload: Record<string, unknown> = {
@@ -152,7 +171,7 @@ app.post("/dev/tool/:name", async (req, res) => {
     const { DISPLAY_MAX_PX } = await import("./config.js");
     payload.images = await Promise.all(
       job.files.map(async (_f, i) => {
-        const v = await readVariant(job, i, req.body.full ? null : DISPLAY_MAX_PX);
+        const v = await readVariant(job, i, DISPLAY_MAX_PX);
         return { index: i, width: v.width, height: v.height, dataUrl: toDataUrl(v) };
       }),
     );

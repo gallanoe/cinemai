@@ -245,27 +245,56 @@ const { App } = globalThis.ExtApps;
     poll();
   };
 
+  // Reassemble one full-resolution image from base64 slices. A full-res image
+  // is multiple MB — far over the host's ~150k-char tool-result cap — so it
+  // can't come back whole; get_image_chunk streams it and we concatenate here.
+  async function fetchFullImage(index) {
+    let b64 = "";
+    let offset = 0;
+    let meta = null;
+    for (;;) {
+      const res = await app.callServerTool({
+        name: "get_image_chunk",
+        arguments: { jobId, index, offset },
+      });
+      const part = JSON.parse(res.content[0].text);
+      if (part.error) throw new Error(part.error);
+      meta = part;
+      b64 += part.chunk;
+      offset = part.offset + part.chunk.length;
+      // Guard against a stalled stream that never advances or reports done.
+      if (part.done || part.chunk.length === 0) break;
+    }
+    return { b64, ...meta };
+  }
+
   el.download.addEventListener("click", async () => {
     if (!jobId) return;
     el.download.disabled = true;
     el.download.textContent = "Preparing…";
     try {
-      // Full resolution is fetched only on demand — polls stay small.
-      const res = await app.callServerTool({
-        name: "get_job",
-        arguments: { jobId, full: true },
-      });
-      const state = JSON.parse(res.content[0].text);
-      for (const [i, img] of (state.images ?? []).entries()) {
-        const [, mime, b64] = /^data:([^;]+);base64,(.*)$/.exec(img.dataUrl) ?? [];
-        if (!b64) continue;
-        const ext = (mime.split("/")[1] ?? "png").replace("jpeg", "jpg");
-        const suffix = (state.images.length > 1 ? `-${i + 1}` : "");
-        await app.downloadFile({
-          name: `cinemai-${state.jobId.slice(0, 8)}${suffix}.${ext}`,
-          mimeType: mime,
-          content: b64,
+      let count = latest?.images?.length ?? 1;
+      for (let i = 0; i < count; i++) {
+        const img = await fetchFullImage(i);
+        count = img.imageCount ?? count;
+        const suffix = count > 1 ? `-${i + 1}` : "";
+        // downloadFile takes MCP resource content blocks, not {name, content}.
+        // The saved filename is the file:/// URI's basename; a blob carries the
+        // full-resolution bytes as base64.
+        const { isError } = await app.downloadFile({
+          contents: [
+            {
+              type: "resource",
+              resource: {
+                uri: `file:///cinemai-${jobId.slice(0, 8)}${suffix}.${img.ext}`,
+                mimeType: img.mediaType,
+                blob: img.b64,
+              },
+            },
+          ],
         });
+        // Host denial / user cancel comes back as isError, not a throw.
+        if (isError) throw new Error("Download was denied or cancelled.");
       }
       el.download.textContent = "Download";
     } catch (err) {
