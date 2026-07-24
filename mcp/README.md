@@ -116,7 +116,7 @@ exercise real handlers. The shim's `downloadFile` just logs the resource block r
 | `get_job` | widget only (`_meta.ui.visibility: ["app"]`) | status + display-sized `data:` URLs |
 | `get_image_chunk` | widget only (`_meta.ui.visibility: ["app"]`) | one full-res image as a base64-string slice, for the Download button |
 | `view_image` | model | image content block, downscaled to 768px |
-| `save_image` | model | writes the full-res file to the export folder; returns the saved name + host path, no bytes |
+| `save_image` | model | copies the full-res file to the export folder or an absolute `dest`; won't overwrite unless `overwrite: true`; returns the path, no bytes |
 
 `image://gen/<id>` is also registered as a resource template so a user can deliberately attach a
 generated image. It complements `view_image` rather than replacing it: in most hosts resources are
@@ -138,30 +138,44 @@ no path is guessed. `downloadFile` takes MCP resource content blocks
 saved filename is the `file:///` URI's basename — **not** a flat `{name, content}` object.
 
 **`save_image`** is agent-driven, for "keep this / put it in my project" without a human clicking.
-Here the container question is real and unavoidable, so the design answers it structurally: **the
-server owns the directory; the agent only names the file.**
+It offers two ways to choose where the file lands:
 
-- Files land in `CINEMAI_EXPORT_DIR` (default `~/Documents/Claude` — Cowork's hardcoded working
-  directory on macOS, the highest-probability folder mounted into a sandboxed agent's workspace).
-- `filename` may include subfolders but is **contained**: absolute paths and `../` escapes are
-  rejected by resolving against the export dir and checking the result stays inside. The extension
-  is forced to the true on-disk format, since bytes are copied rather than transcoded.
-- The result reports the workspace-relative name (what a sandboxed agent opens) **and** the host
-  absolute path (for the user). There is no reliable way to compute the agent's VM-side mount path
-  ([claude-code#27758](https://github.com/anthropics/claude-code/issues/27758) — closed as
-  not-planned), so the basename is how the agent finds the file in its own tree.
+- **Default — the export folder.** With no `dest`, files go into `CINEMAI_EXPORT_DIR` (default
+  `~/Documents/Claude` — Cowork's hardcoded working directory on macOS, the highest-probability
+  folder mounted into a sandboxed agent's workspace). `filename` names the file and may include
+  subfolders. The result reports the workspace-relative name (how a sandboxed agent finds it) **and**
+  the host absolute path (for the user).
+- **Explicit — an absolute `dest`.** The agent can pass an absolute path (a directory, or a full
+  file path) to save somewhere specific, such as its own mounted workspace.
 
-**Why not let the agent pass a destination path?** Under Cowork the server runs on the host and the
-agent in a VM; the two have different path namespaces and the host does **not** rewrite paths inside
-MCP tool arguments. A destination the agent invents would be meaningless to the server. Inverting
-control — server picks the folder, agent picks the name — is the only arrangement that works across
-both execution modes.
+Guards, both modes: the extension is forced to the true on-disk format (bytes are copied, not
+transcoded); a `filename` carrying `../` can't climb out of its base directory; and an existing file
+is not overwritten unless `overwrite: true` (implemented with `COPYFILE_EXCL`, so the check is atomic
+rather than a check-then-write race).
 
-> **This only round-trips to the agent if `CINEMAI_EXPORT_DIR` is a folder attached to the session.**
-> The VirtioFS mount is what makes a host-written file appear on the agent's side. If the export dir
-> isn't an attached workspace folder, the file still lands correctly on the host — good for local
-> desktop use — but the agent won't see it. The tool can't detect the difference; point the setting
-> at an attached folder.
+**Why `dest` is trusted, after first refusing it.** The original design forbade an agent-supplied
+path on the theory that under Cowork the agent only knows *VM* paths (`/mnt/…`), which a host-side
+server can't write to. That turned out to be wrong for the case that matters: in local agent mode the
+agent knows the **real host path** of its mounted workspace (just not the rest of the machine). A
+path it hands over is therefore writable and round-trips. Trusting it is also consistent with
+`input_references`, which already reads any absolute path with no allowlist (see below).
+
+**Why not auto-derive the workspace instead of asking the agent?** Because we checked, and it isn't
+there to derive. MCP's [roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots)
+feature is exactly "client exposes its workspace directories to the server," so we instrumented the
+server and connected from Cowork. Result: Cowork's local agent mode **advertises** the `roots`
+capability and **answers** `roots/list` — but returns an **empty array**. The plumbing works end to
+end (a stateful transport, a real round-trip); Cowork simply exposes no roots to MCP servers. So
+there is no host path to read automatically — the agent supplying `dest` is the only channel that
+carries one. (This is the same gap as
+[claude-code#27758](https://github.com/anthropics/claude-code/issues/27758), closed as not-planned.)
+
+> **The default (export-folder) mode only round-trips to the agent if `CINEMAI_EXPORT_DIR` is a
+> folder attached to the session.** The VirtioFS mount is what makes a host-written file appear on
+> the agent's side. If the export dir isn't an attached workspace folder, the file still lands
+> correctly on the host — good for local desktop use — but the agent won't see it. The tool can't
+> detect the difference; point the setting at an attached folder, or pass an explicit `dest` the
+> agent already knows.
 
 ## Reference images (image-to-image)
 

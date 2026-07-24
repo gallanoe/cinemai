@@ -1,5 +1,6 @@
+import { constants } from "node:fs";
 import { copyFile, mkdir } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod";
@@ -312,12 +313,12 @@ export function registerTools(server: McpServer): void {
     {
       title: "Save Image",
       description:
-        "Save a generated image, at full resolution, into the CinemAI export folder — a shared " +
-        "location the user (and, in a sandboxed session, YOU) can access. Use this when the user " +
-        "wants to keep, export, or work with the file rather than just view it inline. " +
-        "You choose the filename but NOT the folder: the server owns the destination directory, " +
-        "so a path you invent for somewhere else would not resolve. After saving, look for the " +
-        "returned filename in your workspace. The returned host path is for the user's reference.",
+        "Save a generated image at full resolution to disk, so it can be kept, exported, or edited " +
+        "rather than only viewed inline. Two ways to choose where it lands: " +
+        "(1) by default it goes into the CinemAI export folder — pass `filename` to name it; or " +
+        "(2) pass `dest`, an ABSOLUTE path, to save somewhere specific, such as your own mounted " +
+        "workspace directory when you know its real path. An existing file is NOT overwritten " +
+        "unless `overwrite` is true. The result reports exactly where the file landed.",
       annotations: { title: "Save Image", readOnlyHint: false },
       inputSchema: {
         handle: z.string().describe("Image handle, e.g. image://gen/<id>. Also accepts a bare id."),
@@ -326,14 +327,27 @@ export function registerTools(server: McpServer): void {
           .string()
           .optional()
           .describe(
-            "Filename to save as, e.g. \"sunset.png\". May include subfolders relative to the " +
-              'export folder ("renders/sunset.png"); they are created as needed. Must NOT be an ' +
-              "absolute path or escape the export folder. The extension is corrected to match the " +
-              "actual image format. Defaults to a name derived from the handle.",
+            'Filename to save as, e.g. "sunset.png". May include subfolders ("renders/sunset.png"), ' +
+              "created as needed. Relative to `dest` if given, otherwise to the export folder. The " +
+              "extension is corrected to match the actual image format. Defaults to a name derived " +
+              "from the handle.",
           ),
+        dest: z
+          .string()
+          .optional()
+          .describe(
+            "Absolute path to save to, overriding the export folder. Either a directory (the name " +
+              "comes from `filename` or is derived) or a full file path ending in an image " +
+              "extension. Use this to save into a directory you can actually see — e.g. your mounted " +
+              "workspace. Must be absolute; relative paths are rejected.",
+          ),
+        overwrite: z
+          .boolean()
+          .optional()
+          .describe("Replace an existing file at the target. Default false: fail if it already exists."),
       },
     },
-    async ({ handle, index, filename }) => {
+    async ({ handle, index, filename, dest, overwrite }) => {
       const id = idFromHandle(handle) ?? handle.trim();
       const job = getJob(id);
 
@@ -354,11 +368,37 @@ export function registerTools(server: McpServer): void {
       // The real on-disk extension is authoritative — the bytes are copied, not
       // transcoded, so the saved extension must match what's actually written.
       const realExt = source.split(".").pop() ?? "png";
+      const hasImageExt = (s: string) => /\.(png|jpe?g|webp|gif)$/i.test(s);
 
-      let name = (filename ?? `cinemai-${job.id.slice(0, 8)}${i > 0 ? `-${i + 1}` : ""}`).trim();
+      // Resolve the target directory and file name from `dest` / `filename`.
+      // A `dest` that names a file (ends in an image extension) supplies both the
+      // directory and the name; otherwise `dest` is the directory and the name
+      // comes from `filename` or a derived default.
+      const derived = `cinemai-${job.id.slice(0, 8)}${i > 0 ? `-${i + 1}` : ""}`;
+      let baseDir: string;
+      let name: string;
+      if (dest) {
+        if (!isAbsolute(dest)) {
+          return {
+            content: [{ type: "text", text: "`dest` must be an absolute path." }],
+            isError: true,
+          };
+        }
+        if (hasImageExt(dest)) {
+          baseDir = dirname(dest);
+          name = basename(dest);
+        } else {
+          baseDir = dest;
+          name = (filename ?? derived).trim();
+        }
+      } else {
+        baseDir = config.exportDir;
+        name = (filename ?? derived).trim();
+      }
+
       if (!name || isAbsolute(name)) {
         return {
-          content: [{ type: "text", text: "filename must be a relative name inside the export folder, not an absolute path." }],
+          content: [{ type: "text", text: "`filename` must be a relative name, not an absolute path." }],
           isError: true,
         };
       }
@@ -367,39 +407,44 @@ export function registerTools(server: McpServer): void {
         name = name.replace(/\.(png|jpe?g|webp|gif)$/i, "") + `.${realExt}`;
       }
 
-      // Containment: after resolving, the destination must still be inside the
-      // export folder. Blocks "../" traversal even through symlink-free paths.
-      const dest = resolve(config.exportDir, name);
-      const rel = relative(config.exportDir, dest);
+      // The name (which may carry subfolders) must not climb out of baseDir. This
+      // guards the filename portion even when `dest` itself is a trusted absolute
+      // directory — a "../../x" filename shouldn't escape it.
+      const target = resolve(baseDir, name);
+      const rel = relative(baseDir, target);
       if (rel.startsWith("..") || isAbsolute(rel)) {
         return {
-          content: [{ type: "text", text: `"${name}" would escape the export folder. Use a plain name or a subfolder path.` }],
+          content: [{ type: "text", text: `"${name}" would escape ${baseDir}. Use a plain name or a subfolder path.` }],
           isError: true,
         };
       }
 
       try {
-        await mkdir(dirname(dest), { recursive: true });
-        await copyFile(source, dest);
+        await mkdir(dirname(target), { recursive: true });
+        // COPYFILE_EXCL makes the "don't overwrite" check atomic — no TOCTOU gap
+        // between testing existence and writing.
+        await copyFile(source, target, overwrite ? 0 : constants.COPYFILE_EXCL);
       } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+          return {
+            content: [{ type: "text", text: `A file named "${name}" already exists at ${target}. Pass overwrite: true to replace it.` }],
+            isError: true,
+          };
+        }
         return { content: [{ type: "text", text: `Could not save image: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
       }
 
-      // Report the workspace-relative name (what the agent can open) AND the
-      // host path (for the user). We can't compute the agent's sandbox-side
-      // mount path, so the relative name is how a sandboxed agent finds it.
-      const savedAs = rel.split(sep).join("/");
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              `Saved ${handleFor(job.id)} to the CinemAI export folder as "${savedAs}". ` +
-              `If you're running in a sandbox, look for it under your mounted workspace; ` +
-              `the file is on the user's machine at ${dest}.`,
-          },
-        ],
-      };
+      // If the file landed in the export folder, also report the workspace-relative
+      // name — that's how a sandboxed agent finds it, since we can't compute its
+      // VM-side mount path. For a custom `dest`, the absolute path is the answer.
+      const inExport = !relative(config.exportDir, target).startsWith("..");
+      const savedAs = inExport ? relative(config.exportDir, target).split(sep).join("/") : null;
+      const text = savedAs
+        ? `Saved ${handleFor(job.id)} to the CinemAI export folder as "${savedAs}". ` +
+          `If you're running in a sandbox, look for it under your mounted workspace; ` +
+          `the file is on the user's machine at ${target}.`
+        : `Saved ${handleFor(job.id)} to ${target}.`;
+      return { content: [{ type: "text", text }] };
     },
   );
 
