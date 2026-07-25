@@ -66,3 +66,19 @@ export const VIDEO_POLL_TIMEOUT_MS = 10 * 60_000;
  */
 export const REFERENCE_MAX_PX = 2048;
 export const REFERENCE_MAX_BYTES = 4 * 1024 * 1024;
+/**
+ * Ceiling on the COMBINED size of all reference images in one request, measured
+ * in raw bytes before base64 (which inflates by ~4/3).
+ *
+ * The per-image limits above are necessary but not sufficient: three 1254px
+ * PNGs at 1.66MB each clear both of them individually and pass through
+ * untouched, yet together make a ~6.6MB base64 body that OpenRouter rejects
+ * with an opaque `fetch failed`. Measured: that request fails on both
+ * gpt-image-2 and gemini-2.5-flash-image, while the same three images at
+ * ~0.42MB total succeed. Multi-reference work — character sheets, compositing —
+ * hits this constantly, so the budget is enforced across the whole set.
+ */
+export const REFERENCE_TOTAL_MAX_BYTES = 3 * 1024 * 1024;
+/** Don't shrink a reference below this long edge while fitting the budget; past
+ *  here the image stops carrying usable detail and the call is better failed. */
+export const REFERENCE_MIN_PX = 512;

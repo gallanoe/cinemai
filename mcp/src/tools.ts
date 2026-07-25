@@ -21,7 +21,7 @@ import {
   type Job,
 } from "./jobs.js";
 import { validateRequest, validateVideoRequest } from "./models.js";
-import { resolveReferences } from "./references.js";
+import { resolveReferences, type ReferenceFitting } from "./references.js";
 
 export const WIDGET_URI = "ui://widgets/job.html";
 export const VIDEO_WIDGET_URI = "ui://widgets/video.html";
@@ -66,6 +66,18 @@ function ratioFromPixels({ width, height }: { width: number; height: number }): 
   const d = gcd(width, height);
   return `${width / d}:${height / d}`;
 }
+
+/** Surface aggregate-budget shrinking in the tool result. References feed another
+ *  generation, so a silent downscale would show up later as unexplained drift. */
+const fittingNote = (f: ReferenceFitting) =>
+  f
+    ? {
+        referencesDownscaled:
+          `Reference images were reduced to ${f.downscaledTo}px on the long edge (from ${f.from}px) ` +
+          `so the request would fit the provider's size limit. If fine detail or likeness matters, ` +
+          `send fewer references.`,
+      }
+    : {};
 
 const jobSummary = (job: Job) => ({
   handle: handleForJob(job),
@@ -232,8 +244,9 @@ export function registerTools(server: McpServer): void {
       // bad handle is a caller mistake the model can fix immediately, and it
       // would be invisible if it surfaced as a job failure 30s later.
       let resolved;
+      let fitting;
       try {
-        resolved = await resolveReferences(specs);
+        ({ refs: resolved, fitting } = await resolveReferences(specs));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return { content: [{ type: "text", text: message }], isError: true };
@@ -259,7 +272,7 @@ export function registerTools(server: McpServer): void {
       );
 
       // Handle + metadata only. No bytes — this is the core invariant.
-      return { content: [{ type: "text", text: JSON.stringify(jobSummary(job)) }] };
+      return { content: [{ type: "text", text: JSON.stringify({ ...jobSummary(job), ...fittingNote(fitting) }) }] };
     },
   );
 
@@ -363,8 +376,9 @@ export function registerTools(server: McpServer): void {
       // Resolve up front so a bad path or handle is an immediate, correctable
       // tool error rather than a job failure minutes later.
       let resolved;
+      let fitting;
       try {
-        resolved = await resolveReferences(specs);
+        ({ refs: resolved, fitting } = await resolveReferences(specs));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return { content: [{ type: "text", text: message }], isError: true };
@@ -394,7 +408,7 @@ export function registerTools(server: McpServer): void {
       );
 
       // Handle + metadata only. No bytes — this is the core invariant.
-      return { content: [{ type: "text", text: JSON.stringify(jobSummary(job)) }] };
+      return { content: [{ type: "text", text: JSON.stringify({ ...jobSummary(job), ...fittingNote(fitting) }) }] };
     },
   );
 

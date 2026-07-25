@@ -275,6 +275,26 @@ reference is an *input* to another generation, so artifacts compound instead of 
 The ~150k host cap does not apply on this path: these bytes go into the OpenRouter request body,
 not a tool result.
 
+**Those per-image limits are necessary but not sufficient, and the gap is easy to hit.** Several
+references that each clear them can still add up to a body OpenRouter refuses. Measured: three
+1254×1254 PNGs at ~1.66 MB each pass every per-image check and are therefore sent untouched,
+producing a ~6.6 MB base64 body that fails on **both** `openai/gpt-image-2` and
+`google/gemini-2.5-flash-image` with an opaque `fetch failed` — no status code, nothing naming
+size. The same three images at ~0.42 MB total succeed. Multi-reference work (character sheets,
+compositing, multi-angle consistency) is exactly where this lands, so `REFERENCE_TOTAL_MAX_BYTES`
+(3 MB) bounds the **combined** set: `resolveReferences` re-encodes everything at progressively
+halved long edges until the total fits, giving up at `REFERENCE_MIN_PX` (512) with an error that
+names the problem rather than another `fetch failed`.
+
+The shrink is **reported, not silent** — the tool result carries a `referencesDownscaled` note. A
+quietly halved reference would surface later as unexplained likeness drift, which is a worse
+outcome than being told. `https://` references contribute nothing to the budget, since OpenRouter
+fetches those itself and their bytes never pass through this server.
+
+> The exact upstream threshold is **not** known. 6.6 MB fails and 0.42 MB succeeds; the boundary
+> between them has not been bisected, and OpenRouter documents no limit. The 3 MB budget is a
+> conservative guess from those two data points, not a published figure — treat it as tunable.
+
 > **A model-supplied absolute path is read from disk.** That is the intended capability for a
 > local single-user server, and it is worth being deliberate about before hosting this for anyone
 > else. There is no path allowlist.
