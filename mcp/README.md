@@ -155,7 +155,7 @@ It exercises the chunk-streaming playback path, not the iframe's restrictions.
 
 | Tool | Visibility | Returns |
 |---|---|---|
-| `generate_image` | model | `{handle, jobId, kind, status, prompt, model}` — no bytes, ~45ms; optional `input_references` |
+| `generate_image` | model | `{handle, jobId, kind, status, prompt, model}` — no bytes, ~45ms; optional `resolution`, `quality`, `background`, `output_format`, `output_compression`, `aspect_ratio`/`size`, `seed`, `input_references` |
 | `generate_video` | model | same shape with `kind: "video"` and a `video://gen/<id>` handle; optional `duration`, `resolution`, `generate_audio`, `input_references` + `reference_mode` |
 | `get_job` | widget only (`_meta.ui.visibility: ["app"]`) | status + display-sized `data:` URLs (image) or a media URL (video) |
 | `get_output_chunk` | widget only (`_meta.ui.visibility: ["app"]`) | one full-res image or video as a base64-string slice, for the Download button |
@@ -291,15 +291,41 @@ Capabilities are fetched once from `/api/v1/images/models` and cached at boot. R
 validated locally before spending a generation:
 
 - `n` against the model's max — the default model caps at **1**, despite the schema allowing more
-- `aspect_ratio` against the model's supported enum
+- `aspect_ratio`, `resolution`, `quality`, `background` and `output_format` against each model's
+  supported enum
+- `output_compression` against the model's reported range
 - `input_references` count against the model's max — this varies a lot: `openai/gpt-image-*` accept
   16, `bytedance-seed/seedream-4.5` 14, and the default `google/gemini-2.5-flash-image` only **3**
 
 These failures return the supported values rather than a provider error.
 
 An **unreported** capability skips its check rather than rejecting. Some models omit descriptors —
-`google/gemini-2.5-flash-image-preview` reports no `input_references` range at all — and a false
-rejection would block a call that would have worked. Unknown model → allow, same principle.
+`openai/gpt-image-2` reports no `aspect_ratio` enum at all, yet accepts one — and a false rejection
+would block a call that would have worked. Unknown model → allow, same principle.
+
+One check is model-independent and therefore runs even for unknown models: `background:
+"transparent"` with `output_format: "jpeg"` can't be satisfied by any provider, because JPEG has no
+alpha channel.
+
+### `size` vs `resolution` + `aspect_ratio`
+
+OpenRouter offers two ways to ask for dimensions, and they do not compose. `resolution` is a
+normalized tier (`512`/`1K`/`2K`/`4K`) that combines with `aspect_ratio`; `size` is a shorthand that
+also accepts **explicit pixels** (`"1536x1024"`), and explicit pixels are *authoritative* — a
+`resolution` or a disagreeing `aspect_ratio` sent alongside them is rejected upstream with
+`HTTP 400: size "1024x1024" conflicts with aspect_ratio "16:9"`.
+
+That collides with the always-send-an-aspect-ratio rule above: the `1:1` default alone would 400
+every non-square pixel request. So an explicit-pixel `size` **suppresses** `aspect_ratio`, and the
+shape the widget needs is derived from the pixels instead. An `aspect_ratio` that *agrees* with the
+pixels is merely redundant and is dropped rather than rejected; only a genuine contradiction (or any
+`resolution`) returns an error, and it names both values.
+
+Tiers are normalized per-provider rather than being a literal pixel count, and `aspect_ratio` is
+clamped to what the provider actually offers. Two measured examples: `google/gemini-3.1-flash-image`
+at `resolution: "512"`, `aspect_ratio: "8:1"` returns **1456×176**; `openai/gpt-image-2` asked for
+`16:9` returns **1536×1024** (3:2) — that model's real shape set is square, 3:2 and 2:3, so a
+widescreen request lands on the nearest thing it has.
 
 ## Codec choice
 
@@ -364,11 +390,31 @@ Verified against a live key:
   (`{name, content}` instead of `{contents: [{resource: {…blob}}]}`).
 - `save_output` filename handling — containment (`../` and absolute paths rejected), extension
   correction, and a full-resolution copy verified locally against a real job.
+- **Rendering parameters** (`resolution`, `quality`, `background`, `output_format`,
+  `output_compression`) — 19 validation cases against live descriptors, all passing, including
+  `transparent` on `gpt-image-2` (which reports `auto, opaque` only), `8:1` on the original Nano
+  Banana, an out-of-range compression level, and fail-open on an unknown model. Four rejections and
+  one generation exercised end to end through a real MCP client.
+- **Live round trips with the new parameters** — `gpt-image-2` at `quality: "low"`,
+  `output_format: "jpeg"`, `output_compression: 60`, `size: "1024x1024"` → a 1024×1024 JPEG in 12s
+  for $0.006; `gemini-3.1-flash-image` at `resolution: "512"`, `aspect_ratio: "8:1"` → a 1456×176
+  PNG in 8s for $0.045.
+- **The `size`/`aspect_ratio` conflict** — confirmed upstream as a real `HTTP 400`, and confirmed
+  that the guard rejects a contradiction while letting an agreeing pair through (the resulting job
+  records `aspectRatio: "3:2"` derived from `size: "1536x1024"`).
 
-**Not yet verified: a generation that actually sends `input_references`.** The capability
-descriptors are confirmed live and the code typechecks, but no round trip has been made with a
-reference attached — so the request-body shape OpenRouter accepts is still taken from the docs
-rather than observed. All three source forms are unexercised.
+**Verified: generations that actually send `input_references`.** Four round trips, on both
+`openai/gpt-image-2` and `google/gemini-3.1-flash-image`: an `image://gen/<id>` handle (normalized
+to `#0` in the job record), an absolute local path, and a stale handle correctly rejected as an
+immediate tool error rather than a job failure. The edits landed semantically — "change only the
+pear to a red apple, keep everything else the same" preserved framing, lighting and shadow
+direction. **The https:// URL form remains unexercised.**
+
+That test also confirmed a behaviour worth designing around: **an edit regenerates the whole
+image rather than patching it.** The unedited regions of the apple result are visually
+consistent with the source but not pixel-identical — the fruit sits slightly differently and the
+contact shadow differs. A preserve list reduces drift; it cannot eliminate it. There is no mask
+parameter on this endpoint, so a region that must be bit-exact has to be composited downstream.
 
 **Not yet verified: `save_output` round-tripping into a sandboxed agent.** The write path is
 confirmed locally, but that a file written to `CINEMAI_EXPORT_DIR` on the host actually surfaces in

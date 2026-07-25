@@ -11,6 +11,13 @@ export type GenerateParams = {
   n?: number;
   size?: string;
   aspect_ratio?: string;
+  /** Normalized tier ("512" | "1K" | "2K" | "4K"); pixel dimensions are derived
+   *  per-provider. Mutually exclusive with an explicit-pixel `size`. */
+  resolution?: string;
+  quality?: string;
+  background?: string;
+  output_format?: string;
+  output_compression?: number;
   seed?: number;
   input_references?: InputReference[];
 };
@@ -45,6 +52,11 @@ export async function generateImages(
   if (params.n !== undefined) body.n = params.n;
   if (params.size !== undefined) body.size = params.size;
   if (params.aspect_ratio !== undefined) body.aspect_ratio = params.aspect_ratio;
+  if (params.resolution !== undefined) body.resolution = params.resolution;
+  if (params.quality !== undefined) body.quality = params.quality;
+  if (params.background !== undefined) body.background = params.background;
+  if (params.output_format !== undefined) body.output_format = params.output_format;
+  if (params.output_compression !== undefined) body.output_compression = params.output_compression;
   if (params.seed !== undefined) body.seed = params.seed;
   if (params.input_references?.length) body.input_references = params.input_references;
 

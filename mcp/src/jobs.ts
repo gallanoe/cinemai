@@ -25,6 +25,15 @@ export type Job = {
   size?: string;
   aspectRatio?: string;
   seed?: number;
+  /** Resolution tier. Both kinds use this: "1K"/"2K"/"4K" for images, "720p"
+   *  and friends for video. */
+  resolution?: string;
+  /** Images only: rendering and encoding settings, kept so a job can be
+   *  reproduced from its record. */
+  quality?: string;
+  background?: string;
+  outputFormat?: string;
+  outputCompression?: number;
   /** Images only: how many were requested. Videos are always a single clip. */
   n: number;
   /** The reference *specs* as given, never the resolved bytes — a job record
@@ -40,7 +49,6 @@ export type Job = {
 
   // --- video only -------------------------------------------------------
   duration?: number;
-  resolution?: string;
   generateAudio?: boolean;
   /** Upstream OpenRouter job id + polling URL; retained so a future restart
    *  could resume polling instead of only marking the job failed. */
@@ -143,6 +151,10 @@ export function outputFilePath(job: Job, index: number): string {
 export async function startJob(
   params: GenerateParams & { n: number },
   refSpecs?: string[],
+  /** Shape for the widget's placeholder, when it can't be read off
+   *  `params.aspect_ratio` — an explicit-pixel `size` carries the ratio instead,
+   *  and sending `aspect_ratio` alongside it is a 400 upstream. */
+  displayAspectRatio?: string,
 ): Promise<Job> {
   const job: Job = {
     id: randomUUID(),
@@ -151,9 +163,14 @@ export async function startJob(
     prompt: params.prompt,
     model: params.model ?? config.defaultModel,
     size: params.size,
-    aspectRatio: params.aspect_ratio,
+    aspectRatio: params.aspect_ratio ?? displayAspectRatio,
     seed: params.seed,
     n: params.n,
+    resolution: params.resolution,
+    quality: params.quality,
+    background: params.background,
+    outputFormat: params.output_format,
+    outputCompression: params.output_compression,
     ...(refSpecs?.length ? { inputReferences: refSpecs } : {}),
     createdAt: Date.now(),
   };

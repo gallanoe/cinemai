@@ -5,6 +5,9 @@ const VIDEO_MODELS_URL = "https://openrouter.ai/api/v1/videos/models";
 
 type EnumParam = { type: "enum"; values: string[] };
 type RangeParam = { type: "range"; min: number; max: number };
+/** Some descriptors report a bare capability flag, e.g. `seed: {type: "boolean"}`. */
+type BoolParam = { type: "boolean" };
+type Param = EnumParam | RangeParam | BoolParam;
 
 export type ModelCaps = {
   id: string;
@@ -12,7 +15,20 @@ export type ModelCaps = {
   aspectRatios?: string[];
   maxN?: number;
   maxInputReferences?: number;
+  /** Resolution tiers, e.g. ["512","1K","2K","4K"]. */
+  resolutions?: string[];
+  /** Rendering-quality tiers, e.g. ["auto","low","medium","high"]. */
+  qualities?: string[];
+  /** Background treatments. Note gpt-image-2 reports ["auto","opaque"] — no
+   *  transparency — where gpt-image-1 also offered "transparent". */
+  backgrounds?: string[];
+  outputFormats?: string[];
+  outputCompression?: { min: number; max: number };
 };
+
+const asEnum = (p?: Param): string[] | undefined =>
+  p?.type === "enum" && p.values.length ? p.values : undefined;
+const asMax = (p?: Param): number | undefined => (p?.type === "range" ? p.max : undefined);
 
 let cache: Map<string, ModelCaps> | null = null;
 let inflight: Promise<Map<string, ModelCaps>> | null = null;
@@ -42,19 +58,25 @@ export async function loadModelCaps(): Promise<Map<string, ModelCaps>> {
         const m = raw as {
           id?: string;
           name?: string;
-          supported_parameters?: Record<string, EnumParam | RangeParam | undefined>;
+          supported_parameters?: Record<string, Param | undefined>;
         };
         if (!m.id) continue;
         const p = m.supported_parameters ?? {};
-        const ar = p.aspect_ratio;
-        const n = p.n;
-        const refs = p.input_references;
+        const compression = p.output_compression;
         map.set(m.id, {
           id: m.id,
           name: m.name,
-          aspectRatios: ar?.type === "enum" ? ar.values : undefined,
-          maxN: n?.type === "range" ? n.max : undefined,
-          maxInputReferences: refs?.type === "range" ? refs.max : undefined,
+          aspectRatios: asEnum(p.aspect_ratio),
+          maxN: asMax(p.n),
+          maxInputReferences: asMax(p.input_references),
+          resolutions: asEnum(p.resolution),
+          qualities: asEnum(p.quality),
+          backgrounds: asEnum(p.background),
+          outputFormats: asEnum(p.output_format),
+          outputCompression:
+            compression?.type === "range"
+              ? { min: compression.min, max: compression.max }
+              : undefined,
         });
       }
       console.error(`[models] cached capabilities for ${map.size} image model(s)`);
@@ -79,9 +101,42 @@ export async function validateRequest(params: {
   n?: number;
   aspect_ratio?: string;
   inputReferences?: number;
+  resolution?: string;
+  quality?: string;
+  background?: string;
+  output_format?: string;
+  output_compression?: number;
 }): Promise<Validation> {
+  // Alpha needs an alpha-capable container. This one is a property of the
+  // request rather than of the model, so it's checked even for unknown models —
+  // and before the capability lookup, since a JPEG cutout is never satisfiable.
+  if (params.background === "transparent" && params.output_format === "jpeg") {
+    return {
+      ok: false,
+      message:
+        'background: "transparent" needs an alpha-capable output_format. Use "png" or "webp", or drop the transparent background.',
+    };
+  }
+
   const caps = (await loadModelCaps()).get(params.model);
   if (!caps) return { ok: true };
+
+  // Every enum-valued parameter fails the same way, and the useful error is
+  // always "here is what this model does take" — so they share one check.
+  const enumCheck = (
+    label: string,
+    value: string | undefined,
+    supported: string[] | undefined,
+    hint = "",
+  ): Validation | null => {
+    if (value === undefined || !supported?.length || supported.includes(value)) return null;
+    return {
+      ok: false,
+      message:
+        `${params.model} does not support ${label} "${value}". ` +
+        `Supported: ${supported.join(", ")}.${hint}`,
+    };
+  };
 
   // Reference support varies widely — some models take 16, others 4, others
   // none. As elsewhere here, an unreported capability means "skip the check"
@@ -110,17 +165,31 @@ export async function validateRequest(params: {
     };
   }
 
-  if (
-    params.aspect_ratio !== undefined &&
-    caps.aspectRatios &&
-    !caps.aspectRatios.includes(params.aspect_ratio)
-  ) {
-    return {
-      ok: false,
-      message:
-        `${params.model} does not support aspect_ratio "${params.aspect_ratio}". ` +
-        `Supported: ${caps.aspectRatios.join(", ")}.`,
-    };
+  const enumFailure =
+    enumCheck("aspect_ratio", params.aspect_ratio, caps.aspectRatios) ??
+    enumCheck("resolution", params.resolution, caps.resolutions) ??
+    enumCheck("quality", params.quality, caps.qualities) ??
+    enumCheck(
+      "background",
+      params.background,
+      caps.backgrounds,
+      // The common case by far: a model that renders opaque-only. Say what to do
+      // instead, because "supported: auto, opaque" alone doesn't suggest a fix.
+      params.background === "transparent"
+        ? " For a cutout, generate on a plain flat backdrop and remove it afterwards, or pick a model that reports transparent."
+        : "",
+    ) ??
+    enumCheck("output_format", params.output_format, caps.outputFormats);
+  if (enumFailure) return enumFailure;
+
+  if (params.output_compression !== undefined && caps.outputCompression) {
+    const { min, max } = caps.outputCompression;
+    if (params.output_compression < min || params.output_compression > max) {
+      return {
+        ok: false,
+        message: `${params.model} accepts output_compression between ${min} and ${max}; got ${params.output_compression}.`,
+      };
+    }
   }
 
   return { ok: true };

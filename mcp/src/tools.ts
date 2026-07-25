@@ -50,6 +50,23 @@ const mediaUrlFor = (job: Job, index = 0) => {
  *  cap so the surrounding JSON envelope still fits with headroom. */
 const DOWNLOAD_CHUNK_CHARS = 100_000;
 
+/** `"2048x1152"` → `{width, height}`; anything else (a tier like `"2K"`, or
+ *  nothing) → null. Only explicit pixels conflict with aspect_ratio upstream. */
+function parsePixelSize(size?: string): { width: number; height: number } | null {
+  const match = /^\s*(\d+)\s*[x×]\s*(\d+)\s*$/i.exec(size ?? "");
+  if (!match) return null;
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  return width > 0 && height > 0 ? { width, height } : null;
+}
+
+/** The reduced `"w:h"` the widget sizes its placeholder from. */
+function ratioFromPixels({ width, height }: { width: number; height: number }): string {
+  const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
+  const d = gcd(width, height);
+  return `${width / d}:${height / d}`;
+}
+
 const jobSummary = (job: Job) => ({
   handle: handleForJob(job),
   jobId: job.id,
@@ -59,7 +76,10 @@ const jobSummary = (job: Job) => ({
   model: job.model,
   aspectRatio: job.aspectRatio,
   ...(job.kind === "video" && job.duration ? { duration: job.duration } : {}),
-  ...(job.kind === "video" && job.resolution ? { resolution: job.resolution } : {}),
+  ...(job.resolution ? { resolution: job.resolution } : {}),
+  ...(job.kind === "image" && job.size ? { size: job.size } : {}),
+  ...(job.kind === "image" && job.quality ? { quality: job.quality } : {}),
+  ...(job.kind === "image" && job.background ? { background: job.background } : {}),
   ...(job.n > 1 ? { n: job.n } : {}),
   ...(job.inputReferences?.length ? { inputReferences: job.inputReferences } : {}),
   ...(job.error ? { error: job.error } : {}),
@@ -86,7 +106,14 @@ export function registerTools(server: McpServer): void {
           .optional()
           .describe(`OpenRouter image model slug. Defaults to ${config.defaultModel}.`),
         n: z.number().int().min(1).max(4).optional().describe("How many images (1-4). Default 1."),
-        size: z.string().optional().describe('Size tier ("2K") or pixels ("2048x2048").'),
+        size: z
+          .string()
+          .optional()
+          .describe(
+            'Explicit pixel dimensions ("2048x1152"). Prefer resolution + aspect_ratio; use this ' +
+              "only when exact pixels matter, and then omit both of those — passing them alongside " +
+              "explicit pixels is rejected.",
+          ),
         aspect_ratio: z
           .string()
           .optional()
@@ -95,6 +122,43 @@ export function registerTools(server: McpServer): void {
               `subject — widescreen for cinematic or landscape shots, tall for portraits. ` +
               `Defaults to ${DEFAULT_ASPECT_RATIO}.`,
           ),
+        resolution: z
+          .string()
+          .optional()
+          .describe(
+            'Resolution tier: "512", "1K", "2K", or "4K". Higher tiers cost more and take longer, ' +
+              "so iterate at a low tier and re-render the keeper high. Supported tiers vary by " +
+              "model; omit to take the model's default.",
+          ),
+        quality: z
+          .enum(["auto", "low", "medium", "high"])
+          .optional()
+          .describe(
+            "Rendering quality. Trades cost and latency against fidelity — use low while " +
+              "exploring and high for a final image. Only some models offer this; others ignore it.",
+          ),
+        background: z
+          .enum(["auto", "transparent", "opaque"])
+          .optional()
+          .describe(
+            '"transparent" produces a cutout with an alpha channel, for logos, icons, stickers ' +
+              "and anything to be composited — it requires output_format png or webp, and not " +
+              "every model supports it.",
+          ),
+        output_format: z
+          .enum(["png", "jpeg", "webp"])
+          .optional()
+          .describe(
+            "Encoding of the returned bytes. png for flat art, text and transparency; jpeg or " +
+              "webp for photographic images where file size matters.",
+          ),
+        output_compression: z
+          .number()
+          .int()
+          .min(0)
+          .max(100)
+          .optional()
+          .describe("Compression level 0-100 for jpeg/webp output. Ignored for png."),
         seed: z.number().int().optional().describe("Seed for deterministic generation."),
         input_references: z
           .array(z.string())
@@ -113,13 +177,40 @@ export function registerTools(server: McpServer): void {
     },
     async (args) => {
       const model = args.model ?? config.defaultModel;
-      // Always send an explicit aspect ratio. Providers differ in what they
-      // default to, and the widget needs the shape up front to size its
-      // placeholder — otherwise the frame renders square and snaps on arrival.
-      const aspectRatio = args.aspect_ratio ?? DEFAULT_ASPECT_RATIO;
       const n = args.n ?? 1;
 
       const specs = args.input_references ?? [];
+
+      // An explicit-pixel `size` is authoritative upstream, and OpenRouter 400s
+      // on a `resolution` or a *disagreeing* `aspect_ratio` sent alongside it
+      // ("size 1024x1024 conflicts with aspect_ratio 16:9"). Since we otherwise
+      // ALWAYS send an aspect ratio, the 1:1 default alone would fail every
+      // non-square pixel request — so pixels suppress it, and the shape the
+      // widget needs is derived from the dimensions instead. An aspect_ratio
+      // that AGREES with the pixels is merely redundant, so it's dropped rather
+      // than rejected; only a real contradiction is worth an error.
+      const pixels = parsePixelSize(args.size);
+      const pixelRatio = pixels ? ratioFromPixels(pixels) : undefined;
+      if (pixels && (args.resolution || (args.aspect_ratio && args.aspect_ratio !== pixelRatio))) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `size "${args.size}" fixes the dimensions (${pixelRatio}), so it can't be combined ` +
+                `with ${args.resolution ? `resolution "${args.resolution}"` : `aspect_ratio "${args.aspect_ratio}"`}. ` +
+                `Drop one: use size alone for exact pixels, or resolution + aspect_ratio to let the ` +
+                `provider pick the dimensions.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // Always send an explicit aspect ratio otherwise. Providers differ in what
+      // they default to, and the widget needs the shape up front to size its
+      // placeholder — otherwise the frame renders square and snaps on arrival.
+      const aspectRatio = pixels ? undefined : (args.aspect_ratio ?? DEFAULT_ASPECT_RATIO);
 
       // Catch provider-rejected combinations before spending a generation.
       const check = await validateRequest({
@@ -127,6 +218,11 @@ export function registerTools(server: McpServer): void {
         n,
         aspect_ratio: aspectRatio,
         inputReferences: specs.length,
+        resolution: args.resolution,
+        quality: args.quality,
+        background: args.background,
+        output_format: args.output_format,
+        output_compression: args.output_compression,
       });
       if (!check.ok) {
         return { content: [{ type: "text", text: check.message }], isError: true };
@@ -150,10 +246,16 @@ export function registerTools(server: McpServer): void {
           n,
           size: args.size,
           aspect_ratio: aspectRatio,
+          resolution: args.resolution,
+          quality: args.quality,
+          background: args.background,
+          output_format: args.output_format,
+          output_compression: args.output_compression,
           seed: args.seed,
           ...(resolved.length ? { input_references: resolved.map((r) => r.ref) } : {}),
         },
         resolved.map((r) => r.source),
+        pixelRatio,
       );
 
       // Handle + metadata only. No bytes — this is the core invariant.
