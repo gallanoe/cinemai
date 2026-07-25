@@ -1,0 +1,409 @@
+<!doctype html>
+<meta charset="utf-8" />
+<style>
+  :root {
+    color-scheme: light;
+    --bg: transparent;
+    --fg: #1a1a1a;
+    --muted: #6b6b6b;
+    --surface: #f4f4f2;
+    --border: #e2e2de;
+    --accent: #c96442;
+    --danger: #b3261e;
+  }
+  :root.dark {
+    color-scheme: dark;
+    --fg: #ededeb;
+    --muted: #9a9a95;
+    --surface: #262624;
+    --border: #3a3a37;
+    --accent: #d4805f;
+    --danger: #f2b8b5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 14px/1.5 system-ui, -apple-system, sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+  }
+  .wrap { padding: 12px; }
+
+  /* --- pending ------------------------------------------------------- */
+  .frame {
+    aspect-ratio: 16 / 9;
+    width: 100%;
+    border-radius: 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    display: grid;
+    place-items: center;
+    overflow: hidden;
+    position: relative;
+  }
+  .frame.shimmer::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(100deg, transparent 20%, rgba(127, 127, 127, 0.14) 50%, transparent 80%);
+    background-size: 220% 100%;
+    animation: sweep 1.6s ease-in-out infinite;
+  }
+  @keyframes sweep {
+    from { background-position: 180% 0; }
+    to { background-position: -80% 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .frame.shimmer::after { animation: none; }
+  }
+  .status { text-align: center; z-index: 1; padding: 0 20px; }
+  .status .label { font-weight: 500; }
+  .status .timer { color: var(--muted); font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .status .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+
+  /* --- result -------------------------------------------------------- */
+  video.clip {
+    width: 100%;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    display: block;
+    background: #000;
+  }
+
+  .meta { margin-top: 10px; display: flex; gap: 8px; align-items: flex-start; }
+  .meta .text { flex: 1; min-width: 0; }
+  .prompt { overflow-wrap: anywhere; }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+  button {
+    font: inherit;
+    padding: 6px 12px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--fg);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: default; }
+
+  .error { color: var(--danger); }
+  [hidden] { display: none !important; }
+</style>
+
+<div class="wrap">
+  <div id="frame" class="frame shimmer">
+    <div class="status">
+      <div class="label" id="label">Generating video…</div>
+      <div class="timer" id="timer">0.0s</div>
+      <div class="hint" id="hint">This usually takes 30s–2 min.</div>
+    </div>
+  </div>
+
+  <video id="clip" class="clip" hidden controls playsinline preload="metadata"></video>
+
+  <div class="meta">
+    <div class="text">
+      <div class="prompt" id="prompt"></div>
+      <div class="sub" id="sub"></div>
+    </div>
+    <button id="download" hidden>Download</button>
+  </div>
+</div>
+
+<script type="module">
+/*__EXT_APPS_BUNDLE__*/
+const { App } = globalThis.ExtApps;
+
+(async () => {
+  const app = new App({ name: "CinemAIVideo", version: "0.1.0" }, {}, { autoResize: true });
+
+  const el = {
+    frame: document.getElementById("frame"),
+    label: document.getElementById("label"),
+    timer: document.getElementById("timer"),
+    hint: document.getElementById("hint"),
+    clip: document.getElementById("clip"),
+    prompt: document.getElementById("prompt"),
+    sub: document.getElementById("sub"),
+    download: document.getElementById("download"),
+  };
+
+  let jobId = null;
+  let startedAt = Date.now();
+  let polling = false;
+  let tick = null;
+  let latest = null;
+  let blobUrl = null;
+
+  /**
+   * Load the clip over the MCP connection and hand <video> a Blob URL.
+   *
+   * This is the ONLY playback transport, not a fallback. The host serves this
+   * widget under `default-src 'self'`, so `media-src` resolves to the iframe's
+   * own origin and a direct fetch of the server's /media route is blocked by
+   * CSP before it ever reaches the network — confirmed empirically against
+   * Claude Desktop, which reports violations of both `media-src` and
+   * `connect-src` for that URL. The clip therefore rides the same channel as
+   * the Download button, which the host proxies and permits.
+   *
+   * The cost is that the whole file must arrive before playback starts; there
+   * are no range requests. Once loaded, seeking is instant because the entire
+   * clip is already in memory — and `moov`-at-the-end files (which these are)
+   * stop mattering for the same reason.
+   */
+  async function playVideo(onProgress) {
+    const vid = await fetchFullVideo(0, onProgress);
+    // base64 -> bytes in one pass; a clip is a few MB, well within reach.
+    const bin = atob(vid.b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    if (blobUrl) URL.revokeObjectURL(blobUrl);
+    blobUrl = URL.createObjectURL(new Blob([bytes], { type: vid.mediaType }));
+    return blobUrl;
+  }
+
+  const applyTheme = (t) => document.documentElement.classList.toggle("dark", t === "dark");
+  app.onhostcontextchanged = (ctx) => applyTheme(ctx?.theme);
+
+  // OpenRouter reports only pending/in_progress, with no percentage, so show
+  // honest elapsed time rather than a bar implying precision we don't have.
+  const startTimer = () => {
+    tick = setInterval(() => {
+      el.timer.textContent = ((Date.now() - startedAt) / 1000).toFixed(1) + "s";
+    }, 100);
+  };
+  const stopTimer = () => tick && clearInterval(tick);
+
+  // The server always sends an explicit aspect ratio, so the placeholder can
+  // match the clip's shape and nothing reflows when it arrives.
+  function applyAspect(ratio) {
+    if (!ratio) return;
+    const [w, h] = String(ratio).split(":").map(Number);
+    if (w > 0 && h > 0) {
+      el.frame.style.aspectRatio = `${w} / ${h}`;
+      el.clip.style.aspectRatio = `${w} / ${h}`;
+    }
+  }
+
+  function renderPending(state) {
+    el.label.textContent = "Generating video…";
+    applyAspect(state?.aspectRatio);
+    if (state?.prompt) el.prompt.textContent = state.prompt;
+    if (state?.model) el.sub.textContent = state.model;
+  }
+
+  async function renderDone(state) {
+    stopTimer();
+    latest = state;
+
+    el.prompt.textContent = state.prompt ?? "";
+    const secs = (state.elapsedMs / 1000).toFixed(1);
+    const cost = state.cost !== undefined ? ` · $${state.cost.toFixed(4)}` : "";
+    const dur = state.duration ? ` · ${state.duration}s` : "";
+    const res = state.resolution ? ` · ${state.resolution}` : "";
+    el.sub.textContent = `${state.model}${dur}${res} · generated in ${secs}s${cost}`;
+    el.download.hidden = false;
+
+    // The clip has to be pulled over the MCP connection before it can play, so
+    // the frame stays up with real progress rather than going blank.
+    el.label.textContent = "Loading video…";
+    el.hint.textContent = "";
+    el.timer.textContent = "0%";
+
+    try {
+      // Once real dimensions are known, drop the placeholder ratio so the clip
+      // sizes to its own shape instead of letterboxing inside a guessed one.
+      el.clip.onloadedmetadata = () => {
+        el.clip.style.aspectRatio = "";
+      };
+      el.clip.onerror = () => {
+        el.frame.hidden = false;
+        el.clip.hidden = true;
+        el.frame.classList.remove("shimmer");
+        el.label.textContent = "Could not play video";
+        el.label.className = "label error";
+        el.timer.textContent = "The clip downloaded but could not be decoded. Use Download to save it.";
+      };
+
+      el.clip.src = await playVideo((pct) => {
+        el.timer.textContent = pct + "%";
+      });
+      el.frame.hidden = true;
+      el.clip.hidden = false;
+    } catch (err) {
+      el.frame.classList.remove("shimmer");
+      el.label.textContent = "Could not load video";
+      el.label.className = "label error";
+      el.timer.textContent = String(err?.message ?? err);
+      el.hint.textContent = "Use the Download button to save the clip instead.";
+    }
+
+    // Silent — Claude learns the handle resolved without a chat bubble firing
+    // on the user's behalf.
+    app.updateModelContext?.({
+      content: [
+        {
+          type: "text",
+          text: `Video ready: ${state.handle} ("${state.prompt}"). Playing for the user in the widget. It cannot be loaded into your context; use save_output to write it to disk.`,
+        },
+      ],
+    });
+  }
+
+  function renderFailed(state) {
+    stopTimer();
+    el.frame.classList.remove("shimmer");
+    el.label.textContent = "Generation failed";
+    el.label.className = "label error";
+    el.timer.textContent = state.error ?? "Unknown error";
+    el.hint.hidden = true;
+  }
+
+  async function poll() {
+    if (polling || !jobId) return;
+    polling = true;
+    try {
+      const res = await app.callServerTool({ name: "get_job", arguments: { jobId } });
+      const state = JSON.parse(res.content[0].text);
+
+      if (state.status === "running") {
+        renderPending(state);
+        // Video takes 30s–minutes; a 1.5s poll would be ~100 needless calls.
+        setTimeout(poll, 3000);
+      } else if (state.status === "succeeded") {
+        renderDone(state);
+      } else {
+        renderFailed(state);
+      }
+    } catch (err) {
+      stopTimer();
+      el.frame.classList.remove("shimmer");
+      el.label.textContent = "Widget error";
+      el.label.className = "label error";
+      el.timer.textContent = String(err?.message ?? err);
+    } finally {
+      polling = false;
+    }
+  }
+
+  app.ontoolresult = ({ content }) => {
+    let state;
+    try {
+      state = JSON.parse(content[0].text);
+    } catch {
+      // Almost always the host's payload cap swapping in a file pointer.
+      el.label.textContent = "Bad payload from host";
+      el.timer.textContent = String(content?.[0]?.text ?? "").slice(0, 120);
+      return;
+    }
+    jobId = state.jobId;
+    startedAt = Date.now();
+    // Size the frame from the very first paint, before any polling.
+    applyAspect(state.aspectRatio);
+    renderPending(state);
+    startTimer();
+    poll();
+  };
+
+  // Reassemble the clip from base64 slices for the Download button. Playback
+  // uses the HTTP URL instead, but downloadFile takes MCP resource content
+  // blocks, so the bytes have to come back over the tool channel — and a clip
+  // is far over the host's ~150k-char cap, hence the streaming.
+  const CONCURRENCY = 5;
+
+  async function getChunk(index, offset) {
+    const res = await app.callServerTool({
+      name: "get_output_chunk",
+      arguments: { jobId, index, offset },
+    });
+    const part = JSON.parse(res.content[0].text);
+    if (part.error) throw new Error(part.error);
+    return part;
+  }
+
+  /**
+   * Pull one full output back as base64.
+   *
+   * The first slice reports `totalChars`, which makes every remaining offset
+   * computable up front — so the rest are fetched concurrently instead of in a
+   * serial chain. Server-side slicing is a pure function of the offset, so the
+   * pieces reassemble in index order regardless of completion order. This is
+   * the only path video playback has, and a clip can be dozens of slices, so
+   * the round trips are worth overlapping.
+   */
+  async function fetchFullVideo(index, onProgress) {
+    const first = await getChunk(index, 0);
+    const size = first.chunk.length;
+    if (first.done || !first.totalChars || size === 0) {
+      onProgress?.(100);
+      return { b64: first.chunk, ...first };
+    }
+
+    const offsets = [];
+    for (let o = size; o < first.totalChars; o += size) offsets.push(o);
+
+    const parts = new Array(offsets.length);
+    let completed = 0;
+    let cursor = 0;
+    const report = () =>
+      onProgress?.(Math.min(100, Math.round(((completed + 1) / (offsets.length + 1)) * 100)));
+    report();
+
+    // Fixed pool of workers pulling from a shared cursor: keeps CONCURRENCY
+    // requests in flight without building the whole promise list at once.
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, offsets.length) }, async () => {
+        for (;;) {
+          const i = cursor++;
+          if (i >= offsets.length) return;
+          const part = await getChunk(index, offsets[i]);
+          parts[i] = part.chunk;
+          completed++;
+          report();
+        }
+      }),
+    );
+
+    return { b64: first.chunk + parts.join(""), ...first };
+  }
+
+  el.download.addEventListener("click", async () => {
+    if (!jobId) return;
+    el.download.disabled = true;
+    el.download.textContent = "Preparing…";
+    try {
+      const vid = await fetchFullVideo(0, (pct) => {
+        el.download.textContent = `${pct}%`;
+      });
+      // downloadFile takes MCP resource content blocks, not {name, content}.
+      // The saved filename is the file:/// URI's basename; a blob carries the
+      // full bytes as base64.
+      const { isError } = await app.downloadFile({
+        contents: [
+          {
+            type: "resource",
+            resource: {
+              uri: `file:///cinemai-${jobId.slice(0, 8)}.${vid.ext}`,
+              mimeType: vid.mediaType,
+              blob: vid.b64,
+            },
+          },
+        ],
+      });
+      // Host denial / user cancel comes back as isError, not a throw.
+      if (isError) throw new Error("Download was denied or cancelled.");
+      el.download.textContent = "Download";
+    } catch (err) {
+      el.download.textContent = "Failed";
+      console.error(err);
+    } finally {
+      el.download.disabled = false;
+    }
+  });
+
+  await app.connect();
+  applyTheme(app.getHostContext?.()?.theme);
+})();
+</script>

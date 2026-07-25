@@ -247,14 +247,14 @@ const { App } = globalThis.ExtApps;
 
   // Reassemble one full-resolution image from base64 slices. A full-res image
   // is multiple MB — far over the host's ~150k-char tool-result cap — so it
-  // can't come back whole; get_image_chunk streams it and we concatenate here.
+  // can't come back whole; get_output_chunk streams it and we concatenate here.
   async function fetchFullImage(index) {
     let b64 = "";
     let offset = 0;
     let meta = null;
     for (;;) {
       const res = await app.callServerTool({
-        name: "get_image_chunk",
+        name: "get_output_chunk",
         arguments: { jobId, index, offset },
       });
       const part = JSON.parse(res.content[0].text);

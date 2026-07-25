@@ -1,7 +1,8 @@
 # CinemAI MCP
 
-An MCP app server that generates images via [OpenRouter](https://openrouter.ai/docs/guides/overview/multimodal/image-generation)
-and displays them in an inline widget — without dumping image bytes into the conversation.
+An MCP app server that generates images and videos via
+[OpenRouter](https://openrouter.ai/docs/guides/overview/multimodal/image-generation)
+and displays them in an inline widget — without dumping media bytes into the conversation.
 
 ## The design in one picture
 
@@ -9,14 +10,18 @@ and displays them in an inline widget — without dumping image bytes into the c
 generate_image  ──> {handle, status: "running"}          the model sees this (~285 bytes)
                 └─> widget polls get_job
                         └─> data: URL                     the model never sees this
+generate_video  ──> {handle, status: "running"}          the model sees this
+                └─> widget polls get_job
+                        └─> get_output_chunk ─> Blob      the model never sees this
 view_image      ──> image content block, 768px            the model sees this ON REQUEST
-Download button ──> get_image_chunk ─> full-res file      the USER saves this (host download)
-save_image      ──> full-res file in the export folder    the AGENT saves this to the workspace
+Download button ──> get_output_chunk ─> full-res file     the USER saves this (host download)
+save_output     ──> full-res file in the export folder    the AGENT saves this to the workspace
 ```
 
-Delivery paths by audience: **handle** for the model, **`data:` URL** for the eye, **`view_image`**
-for opt-in inspection, and two full-resolution exits — the widget's **Download button** (user) and
-**`save_image`** (agent). None of the full-res paths put bytes in the conversation.
+Delivery paths by audience: **handle** for the model, **`data:` URL** (image) or **Blob from
+streamed chunks** (video) for the eye, **`view_image`** for opt-in inspection, and two
+full-resolution exits — the widget's **Download button** (user) and **`save_output`** (agent). None
+of the full-res paths put bytes in the conversation.
 
 ### Why it's built this way
 
@@ -39,10 +44,39 @@ the MCP connection itself and is correct either way.
 **Full-resolution bytes never fit a single tool result, so they're never sent as one.** The same
 ~150k cap that keeps generation bytes out of chat also bounds the widget's Download button: a full
 2K PNG is ~1.4–2M base64 chars, ~10× over. The button therefore streams the image through
-`get_image_chunk` in <100k-char **base64-string** slices and reassembles them in the widget — the
+`get_output_chunk` in <100k-char **base64-string** slices and reassembles them in the widget — the
 slices are of the base64 text, not the raw buffer, so boundaries never land mid-triplet and plain
-concatenation restores the bytes exactly. `save_image` sidesteps the cap entirely by copying on
+concatenation restores the bytes exactly. `save_output` sidesteps the cap entirely by copying on
 disk and returning only a path. Both ride transports that are correct under either execution mode.
+
+**Video is doubly async, so the poll loop lives server-side.** Unlike images, `POST /api/v1/videos`
+returns a job id immediately and the clip is fetched by polling upstream until `completed`, then
+downloading an MP4 from `unsigned_urls`. That means two async layers: ours (so `generate_video`
+returns instantly) and OpenRouter's. `runVideoJob` owns the upstream poll loop in the background
+and writes the finished MP4 to `data/videos/`, so the widget polls exactly one thing — our
+`get_job` — and never learns that upstream polling exists.
+
+**Video also reaches the widget over the MCP connection — the host's CSP leaves no alternative.**
+The obvious design is to serve clips from `GET /media/<id>.mp4` and let `<video>` use HTTP range
+requests: first frame in milliseconds, real scrubbing, only the needed bytes fetched. That was
+built, and it does not work in the host. Widget iframes are served under `default-src 'self'`, so
+`media-src` resolves to the iframe's own origin and the request is blocked *before it is sent* —
+Claude Desktop reports violations of both `media-src` and `connect-src` for the URL, and the server
+log stays empty because nothing ever reaches the network. No port, CORS header, or
+`CINEMAI_PUBLIC_BASE_URL` value changes this; the policy is set by the host.
+
+So clips ride the same channel as everything else: `get_output_chunk` streams base64 slices, the
+widget reassembles them into a `Blob` and plays that. The costs are real and worth stating — the
+whole file must arrive before playback starts, and a 5s 720p clip is ~1.8M base64 chars across ~19
+slices. Two things soften it: slices after the first are fetched **concurrently** (the first reports
+`totalChars`, which makes every remaining offset computable up front — measured ~5.8× faster than
+the serial chain), and once loaded, seeking is instant because the entire clip is in memory. That
+last point also makes `moov`-at-the-end files a non-issue, which matters because the clips these
+models return are *not* faststart.
+
+`GET /media/<id>` remains, and still supports range requests — it is simply not what the widget
+uses. It is genuinely useful outside the iframe (a browser, `curl`, VLC) and is the value the
+`video://gen/<id>` resource hands back.
 
 ## Deployment model: local-first
 
@@ -52,12 +86,17 @@ in the transport assumes otherwise — but two things are meaningfully better lo
 - **Reference images by file path.** `input_references` accepts an absolute path so the user can
   say "use this photo" about a file they already have. A remote server has no access to that
   filesystem, and the path resolves to a clear error rather than silently doing something else.
-- **Generated images stay on the user's disk** under `data/`, rather than accumulating on a shared
-  host.
+- **Generated images and videos stay on the user's disk** under `data/`, rather than accumulating
+  on a shared host.
+- **Video playback in the widget is transport-independent.** Clips stream over the MCP connection,
+  so playback works wherever the server runs. `CINEMAI_PUBLIC_BASE_URL` only affects the
+  out-of-band `/media` URL.
 
-This does **not** retract the `data:` URL decision below. Cowork's per-task execution toggle means
-even a "local" deployment can move, so pixels still reach the widget over the MCP connection rather
-than via `http://localhost`. Local-first is the target; it is not an assumption the transport makes.
+This does **not** retract the `data:` URL decision for images. Cowork's per-task execution toggle
+means even a "local" deployment can move the *agent*, so pixels still reach the widget over the MCP
+connection rather than via `http://localhost`. Video is the deliberate exception, and only because
+the widget iframe itself renders host-side on the user's machine regardless of where the agent
+runs. Local-first is the target; it is not an assumption the image transport makes.
 
 ## Setup
 
@@ -87,8 +126,8 @@ npm start
 
 `--transport http-only` matters — the SSE probe otherwise swallows widget-capability negotiation.
 
-Desktop caches UI resources aggressively. After editing `widgets/job.html`, **fully quit** (⌘Q,
-not window-close) and relaunch.
+Desktop caches UI resources aggressively. After editing `widgets/job.html` or
+`widgets/video.html`, **fully quit** (⌘Q, not window-close) and relaunch.
 
 ## Development
 
@@ -102,42 +141,69 @@ skipping the Desktop quit-relaunch cycle entirely:
 
 ```
 http://localhost:3000/widget-preview?payload={"jobId":"<id>"}&theme=dark
+http://localhost:3000/widget-preview?widget=video&payload={"jobId":"<id>"}
 ```
 
 The preview injects a fake `ExtApps` shim whose `callServerTool` proxies to `/dev/tool/<name>`
-(`get_job` and `get_image_chunk`), so polling, rendering, and the chunked Download button all
+(`get_job` and `get_output_chunk`), so polling, rendering, and the chunked Download button all
 exercise real handlers. The shim's `downloadFile` just logs the resource block rather than saving.
+`?widget=video` previews the video widget. Note the preview page runs same-origin in a normal tab,
+with none of the host's CSP — so it is the wrong place to test whether a transport is *permitted*.
+It exercises the chunk-streaming playback path, not the iframe's restrictions.
 
 ## Tools
 
 | Tool | Visibility | Returns |
 |---|---|---|
-| `generate_image` | model | `{handle, jobId, status, prompt, model}` — no bytes, ~45ms; optional `input_references` |
-| `get_job` | widget only (`_meta.ui.visibility: ["app"]`) | status + display-sized `data:` URLs |
-| `get_image_chunk` | widget only (`_meta.ui.visibility: ["app"]`) | one full-res image as a base64-string slice, for the Download button |
-| `view_image` | model | image content block, downscaled to 768px |
-| `save_image` | model | copies the full-res file to the export folder or an absolute `dest`; won't overwrite unless `overwrite: true`; returns the path, no bytes |
+| `generate_image` | model | `{handle, jobId, kind, status, prompt, model}` — no bytes, ~45ms; optional `input_references` |
+| `generate_video` | model | same shape with `kind: "video"` and a `video://gen/<id>` handle; optional `duration`, `resolution`, `generate_audio`, `input_references` + `reference_mode` |
+| `get_job` | widget only (`_meta.ui.visibility: ["app"]`) | status + display-sized `data:` URLs (image) or a media URL (video) |
+| `get_output_chunk` | widget only (`_meta.ui.visibility: ["app"]`) | one full-res image or video as a base64-string slice, for the Download button |
+| `view_image` | model | image content block, downscaled to 768px; rejects video handles |
+| `save_output` | model | copies the full-res image **or** video to the export folder or an absolute `dest`; won't overwrite unless `overwrite: true`; returns the path, no bytes |
 
-`image://gen/<id>` is also registered as a resource template so a user can deliberately attach a
-generated image. It complements `view_image` rather than replacing it: in most hosts resources are
-user-driven, so the tool is what makes an image reachable by the *model*.
+`image://gen/<id>` and `video://gen/<id>` are also registered as resource templates so a user can
+deliberately attach a generated file. They complement `view_image` rather than replacing it: in
+most hosts resources are user-driven, so the tool is what makes an image reachable by the *model*.
+The video resource returns its media URL rather than inlined bytes, for the size reason above.
+
+### Video generation
+
+`generate_video` mirrors `generate_image` but targets OpenRouter's async video API. Because a clip
+costs meaningfully more and takes 30s–several minutes, the tool description steers the model toward
+short durations and a fast default model (`bytedance/seedance-2.0-fast`, overridable via
+`CINEMAI_DEFAULT_VIDEO_MODEL`).
+
+`input_references` accepts the same three spec forms as images (handle / `https://` URL / absolute
+path) and is paired with `reference_mode`:
+
+- `first_frame` (default) — the image becomes the clip's opening frame (image-to-video)
+- `last_frame` — the clip ends on it
+- `style` — passed as loose `input_references` guidance without pinning either end
+
+The first two send `frame_images`; `style` sends `input_references`. Upstream treats `frame_images`
+as taking precedence, so only one is ever sent.
+
+**Videos cannot be loaded into model context.** There is no video equivalent of `view_image` — the
+model gets a handle, the user watches the clip. Extracting a still frame for the model to inspect
+would need `ffmpeg` and is deliberately deferred.
 
 `view_image`'s description states its token cost. That sentence is the main lever on whether the
 model reads every image reflexively or only when seeing it actually matters.
 
-## Full-resolution exits: Download button and `save_image`
+## Full-resolution exits: Download button and `save_output`
 
 Two ways to get the real file out, for two actors.
 
 **The widget Download button** is user-driven. It streams the full-res image through
-`get_image_chunk` (see the rationale above) and hands the reassembled base64 to the host's
+`get_output_chunk` (see the rationale above) and hands the reassembled base64 to the host's
 `downloadFile` — the host owns the save location, exactly like a browser download. This makes the
 whole "which filesystem does the container see" question moot: nothing is written server-side and
 no path is guessed. `downloadFile` takes MCP resource content blocks
 (`{contents: [{type: "resource", resource: {uri: "file:///name.png", mimeType, blob}}]}`), and the
 saved filename is the `file:///` URI's basename — **not** a flat `{name, content}` object.
 
-**`save_image`** is agent-driven, for "keep this / put it in my project" without a human clicking.
+**`save_output`** is agent-driven, for "keep this / put it in my project" without a human clicking.
 It offers two ways to choose where the file lands:
 
 - **Default — the export folder.** With no `dest`, files go into `CINEMAI_EXPORT_DIR` (default
@@ -238,7 +304,7 @@ rejection would block a call that would have worked. Unknown model → allow, sa
 ## Codec choice
 
 Originals are stored exactly as OpenRouter returned them (usually PNG) and delivered untouched by
-both full-resolution exits — the Download button (streamed via `get_image_chunk`) and `save_image`
+both full-resolution exits — the Download button (streamed via `get_output_chunk`) and `save_output`
 (copied on disk). Everything that travels **inside a tool result** — the widget's display variant
 and `view_image` — is re-encoded to **JPEG q82**.
 
@@ -256,11 +322,15 @@ generation:
 
 ## Storage
 
-Images at `data/images/<id>-<n>.png`, job records at `data/jobs/<id>.json`. Handles survive
-restarts. Jobs left `running` when the process died are marked `failed` on boot — a job stuck
-`running` forever would hang the widget's poll loop.
+Images at `data/images/<id>-<n>.png`, videos at `data/videos/<id>.mp4`, job records at
+`data/jobs/<id>.json`. One `Job` record type covers both, discriminated by `kind`; records written
+before video support are migrated to `kind: "image"` on load. Handles survive restarts. Jobs left
+`running` when the process died are marked `failed` on boot — a job stuck `running` forever would
+hang the widget's poll loop. For video that also covers a lost upstream poll loop: the upstream job
+id and polling URL are persisted, so resuming rather than failing is a possible future improvement.
 
-There is **no TTL or cleanup pass**; `data/` grows without bound. Add one if this sees heavy use.
+There is **no TTL or cleanup pass**; `data/` grows without bound. Add one if this sees heavy use —
+this matters more now that a single clip can be tens of megabytes.
 
 ## Notes on dependencies
 
@@ -290,9 +360,9 @@ Verified against a live key:
 - Restart recovery — a job left `running` is marked `failed` on boot.
 - Widget rendering and the chunked **Download button** in Claude Desktop — confirmed working after
   fixing two stacked bugs: full-res bytes overflowed the tool-result cap (now streamed via
-  `get_image_chunk`), and `downloadFile` had been called with the wrong argument shape
+  `get_output_chunk`), and `downloadFile` had been called with the wrong argument shape
   (`{name, content}` instead of `{contents: [{resource: {…blob}}]}`).
-- `save_image` filename handling — containment (`../` and absolute paths rejected), extension
+- `save_output` filename handling — containment (`../` and absolute paths rejected), extension
   correction, and a full-resolution copy verified locally against a real job.
 
 **Not yet verified: a generation that actually sends `input_references`.** The capability
@@ -300,7 +370,7 @@ descriptors are confirmed live and the code typechecks, but no round trip has be
 reference attached — so the request-body shape OpenRouter accepts is still taken from the docs
 rather than observed. All three source forms are unexercised.
 
-**Not yet verified: `save_image` round-tripping into a sandboxed agent.** The write path is
+**Not yet verified: `save_output` round-tripping into a sandboxed agent.** The write path is
 confirmed locally, but that a file written to `CINEMAI_EXPORT_DIR` on the host actually surfaces in
 a Cowork agent's mounted workspace — the whole point of the export-folder design — has not been
 observed. It depends on the export dir being an attached workspace folder (see that section), which
@@ -309,3 +379,60 @@ the tool can't enforce.
 **Not yet verified: Cowork specifically.** The widget renders and the Download button works in
 Claude Desktop, but Cowork with "run on your computer" **on vs. off** — the case the `data:` URL and
 chunked-transport choices were made for — has never been confirmed empirically.
+
+### Video: verification status
+
+Verified against a live key:
+
+- Capability descriptors — 17 video models returned from `/api/v1/videos/models`. The real shape
+  differs from the image endpoint and from the prose docs: `supported_frame_images` is a list of
+  frame *types* (`["first_frame","last_frame"]`), not a boolean; `generate_audio` and `seed` are
+  tri-state capability flags where `false` means rejected and `null` means unspecified;
+  `supported_aspect_ratios` is `null` for some models. There is **no** `input_references`
+  capability field at all, so that dimension is unvalidated. `models.ts` parses the observed shape.
+- Capability validation — 12 cases exercised against live descriptors, including unsupported
+  resolution/duration/aspect ratio, `last_frame` on a first-frame-only model, reference images on
+  text-only `openai/sora-2-pro`, `seed` on a model that rejects it, and audio on a silent model.
+  Unknown models and `null` capability fields fail open as intended.
+- The `/media/<id>` route — `Accept-Ranges`, a `206 Partial Content` with correct `Content-Range`,
+  `404` for unknown ids, and `400` for a path-traversal attempt.
+- Tool surface — `generate_video` advertises the video widget, `get_output_chunk` stays
+  `visibility: ["app"]`, and `save_image` is gone in favour of `save_output`.
+- **End-to-end generation** — `bytedance/seedance-2.0-fast`, 4s, 480p, 16:9. `generate_video`
+  returned a handle immediately; the background loop polled ~136s and wrote a 1,376,854-byte
+  H.264 MP4 to `data/videos/`, capturing `cost: 0.2152`. The `get_job` payload for the finished
+  clip is **499 bytes** — the design invariant, against the ~1.84M base64 chars the same clip
+  would have cost inline.
+- Playback transport — the media URL serves the clip byte-identically to the file on disk, and a
+  mid-file range request returns `206` with an exact `Content-Range`.
+- Chunked download for video — 19 round trips reassembled to a **sha256-identical** MP4, so the
+  Download button's transport is confirmed for clips as well as images.
+- `save_output` on a `video://gen/<id>` handle — saves, refuses to clobber an existing file, and
+  corrects a wrong extension (`clip.png` → `clip.mp4`).
+- `view_image` on a video handle explains that video can't enter context, rather than reporting a
+  bogus "no such image".
+- The video widget resource inlines the ext-apps bundle (330 KB) and the dev preview renders.
+
+**Observed provider behaviour worth knowing:** the same prompt with `generate_audio: true` failed
+upstream after ~130s with *"the output audio may contain sensitive information"* — Seedance
+moderates the generated audio track. The failure propagated correctly (job marked `failed`, message
+preserved verbatim), but it means audio generation can fail on prompts whose video succeeds.
+
+**Resolved: the iframe CSP does block HTTP media playback.** This was the open question above, and
+it was answered empirically in Claude Desktop rather than by reading docs. The widget originally
+pointed `<video>` at `http://localhost:$PORT/media/<id>.mp4`; the host reported
+
+```
+CSP blocked http://localhost:3000/media/<id>.mp4
+  violated: media-src        (and connect-src for a fetch probe)
+  policy:   default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data: …
+```
+
+with `MediaError 4 (SRC_NOT_SUPPORTED)` and no corresponding entry in the server's request log —
+i.e. blocked before the request was ever sent. The symptom that pointed at it: **Download worked
+while preview didn't**, because `downloadFile` and `callServerTool` are proxied by the host over the
+MCP connection, whereas `<video src>` was the one direct network request the iframe made.
+
+Playback now goes through `get_output_chunk` into a Blob URL, verified sha256-identical to the file
+on disk, with concurrent slice fetching (~5.8× faster than serial). The `/media` route is retained
+for out-of-band use only.
