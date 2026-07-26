@@ -4,3 +4,6 @@ dist/
 data/
 *.log
 .DS_Store
+
+# TLS material — never commit a private key
+*.pem

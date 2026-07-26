@@ -78,6 +78,50 @@ models return are *not* faststart.
 uses. It is genuinely useful outside the iframe (a browser, `curl`, VLC) and is the value the
 `video://gen/<id>` resource hands back.
 
+## Reachability, TLS and the missing authorization
+
+The server binds **loopback only** (`CINEMAI_HOST`, default `127.0.0.1`). That default is
+deliberate and was a fix, not an original choice: `app.listen(port)` with the host omitted
+makes Node bind every interface, which put an **unauthenticated `/mcp` on the local network**.
+Measured before the change — `LISTEN *:3998`, `http://192.168.4.24:3998/health` → 200, and an
+unauthenticated `POST /mcp` → 200. Anyone able to reach the port could spend the API key.
+
+**TLS is opt-in** via `CINEMAI_TLS_KEY` + `CINEMAI_TLS_CERT`; with neither, the server stays
+plain HTTP, which is the right default for local use. The motivating case is a host that will
+only accept an `https://` connector URL — Cowork does. For a locally-trusted pair:
+
+```bash
+brew install mkcert && mkcert -install
+mkcert localhost 127.0.0.1 ::1
+```
+
+mkcert matters rather than being a convenience: a self-signed certificate will complete the
+TLS handshake but clients reject it, because nothing vouches for it. `mkcert -install` adds a
+local CA to the system trust store so the certificate actually validates.
+
+**`CINEMAI_AUTH_TOKEN` guards `/mcp`** as `Authorization: Bearer <token>`. Unset means no
+check, which is fine while bound to loopback. It stops being optional the moment anything else
+can reach the port — and note that **HTTPS is encryption, not authorization**. Putting the
+server behind a tunnel to obtain an https URL converts "people on my wifi" into "everyone",
+and every call spends OpenRouter credits. The boot log warns when the server is reachable
+off-machine without a token.
+
+`/media/<id>` is deliberately left ungated: those URLs carry unguessable job ids, are
+read-only, and are handed to players that cannot set headers.
+
+Verified: HTTPS serves (200), the gate returns 401 for a missing and a wrong token and 200 for
+the right one, and a LAN request to the loopback-bound port is refused.
+
+### Terminating TLS elsewhere
+
+For a real deployment, a reverse proxy that owns certificate renewal is the better answer, and
+this stays out of its way by defaulting to HTTP — Caddy is three lines and handles Let's
+Encrypt issuance and renewal itself. A tunnel (`cloudflared tunnel --url http://localhost:3000`,
+Tailscale Funnel) gets you an https URL with no certificate handling and no open inbound port,
+which is the least-effort route when the server should stay on your machine. In both cases set
+`CINEMAI_PUBLIC_BASE_URL` to the external https URL, or the `/media` links in `get_job` and the
+`video://gen/<id>` resource keep pointing at `http://localhost`.
+
 ## Deployment model: local-first
 
 This server is designed to **run on the user's own machine**. It can be hosted remotely — nothing

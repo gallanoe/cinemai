@@ -2,6 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import { readFileSync } from "node:fs";
+import http from "node:http";
+import https from "node:https";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import {
@@ -109,6 +111,33 @@ app.use((req, _res, next) => {
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, model: config.defaultModel });
+});
+
+/**
+ * Shared-secret gate on the MCP endpoint.
+ *
+ * No token configured means no check — correct for the default posture, where
+ * the server is bound to loopback and only reachable from this machine. The
+ * moment that changes (an explicit CINEMAI_HOST, or a tunnel handing out a
+ * public URL so a host like Cowork will accept an https connector), the
+ * endpoint becomes something a stranger can POST to, and every call spends the
+ * OpenRouter key. Set CINEMAI_AUTH_TOKEN in that case.
+ *
+ * Deliberately not covering /media: those URLs are unguessable job ids, are
+ * read-only, and are handed to players that can't set headers.
+ */
+app.use("/mcp", (req, res, next) => {
+  if (!config.authToken) return next();
+  const header = req.headers.authorization ?? "";
+  const presented = header.startsWith("Bearer ") ? header.slice(7) : "";
+  // Constant-time-ish: compare lengths first so a short guess can't be
+  // distinguished by timing alone. The token is a shared secret, not a password
+  // hash, so this is proportionate rather than rigorous.
+  if (presented.length !== config.authToken.length || presented !== config.authToken) {
+    console.error(`[auth] rejected ${req.method} /mcp from ${req.ip}`);
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  next();
 });
 
 /**
@@ -285,8 +314,60 @@ app.post("/mcp", async (req, res) => {
   }
 });
 
-app.listen(config.port, () => {
-  console.error(`[cinemai] MCP on http://localhost:${config.port}/mcp`);
-  console.error(`[cinemai] widget preview: http://localhost:${config.port}/widget-preview`);
+/**
+ * Serve over TLS when a key/cert pair is configured, plain HTTP otherwise.
+ *
+ * Express is just a request handler, so the same `app` backs either listener —
+ * nothing downstream needs to know which one it is. TLS lives here rather than
+ * behind a proxy because the motivating case is a host that requires an
+ * `https://` connector URL while the server itself stays on this machine; for a
+ * real deployment a reverse proxy that owns certificate renewal is the better
+ * answer, and this stays out of its way by defaulting to HTTP.
+ */
+function createListener() {
+  const { tlsKeyPath, tlsCertPath } = config;
+  if (!tlsKeyPath && !tlsCertPath) return { server: http.createServer(app), scheme: "http" };
+  if (!tlsKeyPath || !tlsCertPath) {
+    throw new Error(
+      "TLS needs both CINEMAI_TLS_KEY and CINEMAI_TLS_CERT; only one is set. " +
+        "Generate a locally-trusted pair with:  mkcert localhost 127.0.0.1 ::1",
+    );
+  }
+  let key: Buffer;
+  let cert: Buffer;
+  try {
+    key = readFileSync(tlsKeyPath);
+    cert = readFileSync(tlsCertPath);
+  } catch (err) {
+    // Fail at boot with the path, rather than as an opaque handshake error later.
+    throw new Error(
+      `Could not read the TLS key/cert (${err instanceof Error ? err.message : err}). ` +
+        `Checked CINEMAI_TLS_KEY=${tlsKeyPath} and CINEMAI_TLS_CERT=${tlsCertPath}.`,
+    );
+  }
+  return { server: https.createServer({ key, cert }, app), scheme: "https" };
+}
+
+const { server: listener, scheme } = createListener();
+listener.listen(config.port, config.host, () => {
+  const origin = `${scheme}://localhost:${config.port}`;
+  console.error(`[cinemai] MCP on ${origin}/mcp`);
+  console.error(`[cinemai] widget preview: ${origin}/widget-preview`);
   console.error(`[cinemai] default model: ${config.defaultModel}`);
+  console.error(
+    `[cinemai] bound to ${config.host}` +
+      (config.host === "127.0.0.1" ? " (loopback only)" : " — reachable off-machine"),
+  );
+  if (config.host !== "127.0.0.1" && !config.authToken) {
+    console.error(
+      `[cinemai] WARNING: reachable beyond this machine with no CINEMAI_AUTH_TOKEN set. ` +
+        `Anyone who can reach ${origin}/mcp can spend your OpenRouter credits.`,
+    );
+  }
+  if (scheme === "http" && config.publicBaseUrl.startsWith("https://")) {
+    console.error(
+      `[cinemai] note: CINEMAI_PUBLIC_BASE_URL is https but this process serves http — ` +
+        `expected if TLS terminates in a proxy or tunnel ahead of it.`,
+    );
+  }
 });

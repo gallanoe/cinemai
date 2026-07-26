@@ -20,6 +20,21 @@ function required(name: string): string {
 export const config = {
   openrouterApiKey: required("OPENROUTER_API_KEY"),
   port: Number(process.env.PORT ?? 3000),
+  // Loopback by default. Node binds every interface when the host is omitted,
+  // which put an unauthenticated /mcp on the local network — anyone able to
+  // reach the port could spend the API key. Set this to "0.0.0.0" deliberately
+  // if something off-machine genuinely needs to connect.
+  host: process.env.CINEMAI_HOST ?? "127.0.0.1",
+  // Paths to a TLS key/cert pair. Both must be set to serve HTTPS; with neither,
+  // the server stays plain HTTP, which is correct for a local-only setup.
+  // Some hosts (Cowork) will only accept an https:// connector URL.
+  tlsKeyPath: process.env.CINEMAI_TLS_KEY,
+  tlsCertPath: process.env.CINEMAI_TLS_CERT,
+  // Shared secret for /mcp, checked as `Authorization: Bearer <token>`. Unset
+  // means no check, which is fine while bound to loopback. It stops being
+  // optional the moment the server is reachable from anywhere else — a tunnel
+  // turns "my network" into "the internet".
+  authToken: process.env.CINEMAI_AUTH_TOKEN,
   defaultModel: process.env.CINEMAI_DEFAULT_MODEL ?? "google/gemini-2.5-flash-image",
   // Video default: fast + inexpensive, so a first `generate_video` doesn't cost
   // minutes and dollars. Overridable; validation fails open, so a bad slug here
