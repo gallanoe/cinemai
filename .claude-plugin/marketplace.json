@@ -1,0 +1,13 @@
+{
+  "name": "cinemai",
+  "owner": {
+    "name": "gallanoe"
+  },
+  "plugins": [
+    {
+      "name": "cinemai",
+      "source": "./",
+      "description": "Image and video generation via OpenRouter, with inline progress widgets and prompting guidance for GPT Image 2, Nano Banana 2 and Seedance."
+    }
+  ]
+}
