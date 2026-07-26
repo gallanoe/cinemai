@@ -1,0 +1,38 @@
+{
+  "skill_name": "image-prompting",
+  "notes": "Every prompt names the model to use, so the comparison isolates prompt-writing quality rather than model selection. Subagents produce the generate_image call as JSON; the harness executes it against the real server. Assertions grade the call; rendered images are reviewed qualitatively.",
+  "evals": [
+    {
+      "id": 0,
+      "name": "edit-preserves-aspect-ratio",
+      "model_pinned": "openai/gpt-image-2",
+      "prompt": "use gpt image 2 for this — take that Aura Fizz hero (image://gen/7d58b2c7-506b-4a15-9ab0-9bd7c3f55f4f) and swap the can for a tall slim glass bottle. everything else stays exactly as it is — same dusk background, same headline, same lighting",
+      "expected_output": "Passes the handle in input_references and preserves the source's widescreen shape. The source is described only in prose ('widescreen hero at the top of the landing page') — its aspect ratio is NOT given as a field, so the agent has to reason that a 16:9 hero must come back 16:9. Omitting aspect_ratio means the server's 1:1 default squares the client's live hero image.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "poster-two-text-elements",
+      "model_pinned": "google/gemini-3.1-flash-image",
+      "prompt": "use nano banana 2 for this one. i need a poster for our coffee shop's new cold brew — it should say MIDNIGHT COLD BREW big across the top and 'now on tap' underneath it in smaller type. dark and a bit moody. portrait since we're printing it for the window",
+      "expected_output": "Both strings quoted verbatim with a size hierarchy, resolution 2K or 4K (1K goes soft on type, and this is for print), a portrait ratio, and Nano Banana 2's narrative-prose dialect rather than labeled blocks. Superlative filler is a documented anti-pattern on this model specifically.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "capability-wall-conflict",
+      "model_pinned": "openai/gpt-image-2 (requested, but impossible)",
+      "prompt": "can you use gpt image 2 to make a really wide banner for the top of our github readme? misty pine forest ridge at dawn. it needs to be a proper letterbox strip, like 4:1",
+      "expected_output": "The user asks for two things that cannot both be satisfied: GPT Image 2 caps at a 3:1 aspect ratio, so 4:1 is impossible on it. The right move is to recognise the conflict and say so — switching to a model that reaches 4:1 while explaining why, rather than silently producing a 3:1 image or spending a call that gets rejected upstream.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "photoreal-anti-polish",
+      "model_pinned": "google/gemini-3.1-flash-image",
+      "prompt": "use nano banana 2. generate a photo of an elderly woodworker in his workshop. i want it to look like an actual documentary photograph, not that glossy AI look everything has",
+      "expected_output": "Explicit polish suppression, concrete material and texture detail, and camera language — with no superlative filler, which is doubly wrong here because it is both a documented Nano Banana 2 anti-pattern and the direct cause of the look the user rejected. Nano Banana 2 also skews oversaturated, so the prompt should push against that.",
+      "files": []
+    }
+  ]
+}

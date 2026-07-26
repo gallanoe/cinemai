@@ -1,0 +1,7 @@
+# Claude Code writes local state here (settings.local.json, caches). Only the
+# skill symlinks are shared — they point at skills/ and are what makes the
+# skills discoverable in a fresh clone.
+.claude/*
+!.claude/skills/
+
+.DS_Store
