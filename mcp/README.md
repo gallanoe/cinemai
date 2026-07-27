@@ -156,19 +156,41 @@ npm start
 > block in `claude_desktop_config.json` therefore configures `mcp-remote`, **not** this server.
 > Putting the key there looks right and fails at boot.
 
-### Claude Desktop
+### Connecting a host
 
-`~/Library/Application Support/Claude/claude_desktop_config.json`:
+The repo ships `.mcp.json` at its root and is installable as a Claude Code plugin, so hosts
+that read that file pick the server up directly:
+
+```json
+{ "mcpServers": { "cinemai": { "type": "http", "url": "https://localhost:3000/mcp" } } }
+```
+
+> **That URL is `https`, so it only works once TLS is configured** — set `CINEMAI_TLS_KEY`
+> and `CINEMAI_TLS_CERT` (see above) before expecting a host to connect. Change it to `http`
+> if you don't need HTTPS; the server serves plain HTTP by default. HTTPS is here because
+> **Cowork will not accept a connector URL that isn't HTTPS.**
+
+**Claude Desktop, configured by hand** — `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 { "mcpServers": { "cinemai": {
   "command": "npx",
-  "args": ["-y", "mcp-remote", "http://localhost:3000/mcp",
-           "--allow-http", "--transport", "http-only"]
+  "args": ["-y", "mcp-remote", "https://localhost:3000/mcp", "--transport", "http-only"]
 }}}
 ```
 
-`--transport http-only` matters — the SSE probe otherwise swallows widget-capability negotiation.
+`--transport http-only` matters — the SSE probe otherwise swallows widget-capability
+negotiation. Drop the `https` to `http` and add `--allow-http` if you are running without TLS.
+
+> **A locally-trusted certificate may still be rejected by a Node client.** `mkcert -install`
+> adds its CA to the macOS keychain, which is what makes browsers and `curl` accept the
+> certificate — but Node ships its own CA bundle and does not read the keychain. A Node-based
+> MCP client can therefore fail with `SELF_SIGNED_CERT_IN_CHAIN` against a certificate Safari
+> is perfectly happy with. If that happens:
+>
+> ```bash
+> export NODE_EXTRA_CA_CERTS="$(mkcert -CAROOT)/rootCA.pem"
+> ```
 
 Desktop caches UI resources aggressively. After editing `widgets/job.html` or
 `widgets/video.html`, **fully quit** (⌘Q, not window-close) and relaunch.

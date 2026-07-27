@@ -297,8 +297,9 @@ export function registerTools(server: McpServer): void {
           .string()
           .optional()
           .describe(
-            `OpenRouter video model slug, e.g. "google/veo-3.1", "bytedance/seedance-2.0", ` +
-              `"openai/sora-2-pro". Defaults to ${config.defaultVideoModel}.`,
+            `OpenRouter video model slug, e.g. "bytedance/seedance-2.0" (widest aspect ratios ` +
+              `and 1-second duration granularity), "google/veo-3.1-lite" (much cheaper at 4K, ` +
+              `where Seedance only upscales). Defaults to ${config.defaultVideoModel}.`,
           ),
         duration: z
           .number()
